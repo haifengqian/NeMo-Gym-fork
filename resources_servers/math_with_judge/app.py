@@ -68,6 +68,51 @@ class LibraryJudgeMathVerifyResponse(BaseVerifyResponse):
     judge_evaluations: Optional[list[JudgeEvaluation]]
 
 
+def _get_field(obj: Any, key: str, default=None):
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _content_to_text(content: Any) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        pieces: list[str] = []
+        for item in content:
+            text = _get_field(item, "text", None)
+            if text is None:
+                text = _get_field(item, "content", "")
+            if isinstance(text, str):
+                pieces.append(text)
+        return "".join(pieces)
+    return str(content)
+
+
+def _extract_recoverability_prefix_text(body: BaseVerifyRequest) -> str:
+    """Return the forced assistant-prefix text for recoverability probes.
+
+    Probe rollouts carry the kept reasoning prefix as a trailing assistant input
+    item with ``generation_token_ids`` set. That prefix lives in the request
+    input rather than ``response.output``, so we prepend it to the graded text
+    to score the full assistant turn (prefix + continuation). For normal (non
+    probe) rollouts the last input item is not such an assistant message, so this
+    returns "" and is a no-op.
+    """
+    input_value = body.responses_create_params.input
+    if isinstance(input_value, str) or not input_value:
+        return ""
+
+    last_message = input_value[-1]
+    if _get_field(last_message, "role") != "assistant":
+        return ""
+    if not _get_field(last_message, "generation_token_ids"):
+        return ""
+    return _content_to_text(_get_field(last_message, "content", None))
+
+
 class LibraryJudgeMathResourcesServer(SimpleResourcesServer):
     # These judge messages are adapted from ones used in Arena Hard.
     # https://github.com/lmarena/arena-hard-auto/blob/196f6b826783b3da7310e361a805fa36f0be83f3/utils/judge_utils.py
@@ -130,7 +175,10 @@ Example output: "My final verdict is different [[A!=B]]"."""
 
                 assistant_responses.append(content_item.text)
 
-        combined_response = "".join(assistant_responses)
+        combined_response = (
+            _extract_recoverability_prefix_text(body)
+            + "".join(assistant_responses)
+        )
         (
             reward,
             extracted_answer,

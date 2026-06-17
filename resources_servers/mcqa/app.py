@@ -67,6 +67,51 @@ class MCQAVerifyResponse(BaseVerifyResponse):
     extracted_answer: Optional[str]
 
 
+def _get_field(obj: Any, key: str, default=None):
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _content_to_text(content: Any) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        pieces: list[str] = []
+        for item in content:
+            text = _get_field(item, "text", None)
+            if text is None:
+                text = _get_field(item, "content", "")
+            if isinstance(text, str):
+                pieces.append(text)
+        return "".join(pieces)
+    return str(content)
+
+
+def _extract_recoverability_prefix_text(body: BaseVerifyRequest) -> str:
+    """Return the forced assistant-prefix text for recoverability probes.
+
+    Probe rollouts carry the kept reasoning prefix as a trailing assistant input
+    item with ``generation_token_ids`` set. That prefix lives in the request
+    input rather than ``response``, so we prepend it to the graded text to score
+    the full assistant turn (prefix + continuation). For normal (non-probe)
+    rollouts the last input item is not such an assistant message, so this
+    returns "" and is a no-op.
+    """
+    input_value = body.responses_create_params.input
+    if isinstance(input_value, str) or not input_value:
+        return ""
+
+    last_message = input_value[-1]
+    if _get_field(last_message, "role") != "assistant":
+        return ""
+    if not _get_field(last_message, "generation_token_ids"):
+        return ""
+    return _content_to_text(_get_field(last_message, "content", None))
+
+
 def _extract_options_and_expected(
     body: MCQARunRequest,
 ) -> tuple[Optional[list[dict[str, str]]], Optional[str]]:
@@ -230,7 +275,9 @@ class MCQAResourcesServer(SimpleResourcesServer):
 
         pred: Optional[str] = None
 
-        text = body.response.output_text.strip()
+        text = (
+            _extract_recoverability_prefix_text(body) + body.response.output_text
+        ).strip()
         if not text:
             return MCQAVerifyResponse(
                 **body.model_dump(exclude={"expected_answer", "extracted_answer"}),
