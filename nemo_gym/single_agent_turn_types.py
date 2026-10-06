@@ -5,7 +5,7 @@
 
 from collections.abc import Mapping
 
-from pydantic import BaseModel, ConfigDict, JsonValue, model_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 from nemo_gym.base_resources_server import BaseVerifyResponse
 from nemo_gym.episode_types import (
@@ -24,6 +24,12 @@ class SingleAgentTurnTaskInput(BaseModel):
 
     responses_create_params: NeMoGymResponseCreateParamsNonStreaming
     task_data: dict[str, JsonValue]
+    agent_timeout_seconds: float | None = Field(
+        default=None,
+        gt=0,
+        allow_inf_nan=False,
+        description="Agent execution budget after setup; close the agent before grading its preserved state on timeout.",
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -36,13 +42,18 @@ class SingleAgentTurnTaskInput(BaseModel):
             return value
         fields = dict(value)
         response_params = fields.pop("responses_create_params", None)
+        agent_timeout_seconds = fields.pop("agent_timeout_seconds", None)
         task_data = fields.pop("task_data", {})
         if not isinstance(task_data, Mapping):
             return value  # Let the field validator report the malformed canonical container.
         for key in fields.keys() & task_data.keys():
             if fields[key] != task_data[key]:
                 raise ValueError(f"Conflicting task field {key!r} inside and outside task_data")
-        return {"responses_create_params": response_params, "task_data": dict(task_data) | fields}
+        return {
+            "responses_create_params": response_params,
+            "agent_timeout_seconds": agent_timeout_seconds,
+            "task_data": dict(task_data) | fields,
+        }
 
 
 class SingleAgentTurnResult(BaseVerifyResponse):
@@ -57,6 +68,8 @@ class SingleAgentTurnResult(BaseVerifyResponse):
 
     ng_agent_observations: AgentObservationBundle | None = None
     ng_trajectory: TrajectoryRecord | None = None
+    agent_timed_out: bool = False
+    agent_timeout_seconds: float | None = None
 
 
 class SingleAgentTurnFailure(EpisodeFailure):
