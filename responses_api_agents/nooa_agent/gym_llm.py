@@ -170,12 +170,8 @@ def _responses_input(
             ):
                 result.extend(part.model_dump(mode="json", include={"native"})["native"] for part in message.parts)
                 continue
-            # Compatibility with live responses made before durable Gym parts.
-            # A mismatched scope must never regain opaque state via raw_response.
-            if message.replay_scope is None and isinstance(message.raw_response, NeMoGymResponse):
-                result.extend(_dump(item) for item in message.raw_response.output)
-                continue
             # Foreign/edited turns and old archives have only portable authority.
+            # A live raw_response may predate public edits and cannot authorize replay.
             # Preserve readable parts, but do not guess opaque/training metadata.
             if gaps is not None:
                 gaps.append(
@@ -205,10 +201,17 @@ def _responses_input(
                 }
             )
             continue
-        if message.get("role") == "assistant" and message.get("tool_calls"):
+        if message.get("role") == "assistant" and (message.get("tool_calls") or message.get("reasoning_content")):
+            # NOOA renders edited turns as public dictionaries. Match its portable
+            # Responses projection without restoring stale provider/training state.
+            reasoning = message.get("reasoning_content")
+            if reasoning is not None and not isinstance(reasoning, str):
+                raise ValueError("Assistant reasoning_content must be a string.")
+            if reasoning:
+                result.append({"role": "assistant", "content": reasoning})
             if message.get("content"):
                 result.append({"role": "assistant", "content": message["content"]})
-            for call in message["tool_calls"]:
+            for call in message.get("tool_calls") or []:
                 function = call.get("function", {})
                 result.append(
                     {

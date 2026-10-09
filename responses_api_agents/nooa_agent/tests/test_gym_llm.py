@@ -14,10 +14,13 @@
 # limitations under the License.
 
 import json
+from copy import deepcopy
 from http.cookies import SimpleCookie
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from nooa.context_blocks.formatter import OpenAIProviderFormatter
+from nooa.context_blocks.models import RenderedMessage, Role, ToolCallInfo
 from nooa.llm_types import AssistantReasoning, AssistantText
 from nooa.storage.serialization import deserialize, serialize
 from nooa.storage.sqlite import SQLiteStorageManager
@@ -405,6 +408,79 @@ async def test_editing_assistant_text_discards_stale_native_replay_metadata() ->
     assert "generation_log_probs" not in wire
     assert "routed_experts" not in wire
     assert "Checking" not in wire
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_tools", [False, True])
+@pytest.mark.parametrize("content", ["Edited answer.", ""])
+async def test_formatter_history_edits_preserve_public_reasoning_without_native_metadata(
+    with_tools: bool, content: str
+) -> None:
+    llm, client, state = make_llm(mixed_model_response())
+    original = await llm.acall([{"role": "user", "content": "Weather?"}])
+    original_snapshot = original.model_dump(mode="json")
+    original_response = state.calls[0].response.model_dump(mode="json")
+    edited_call = ToolCallInfo(id="call-1", name="weather", arguments='{"city":"Berlin"}')
+    rendered = OpenAIProviderFormatter().format(
+        [
+            RenderedMessage(
+                role=Role.ASSISTANT,
+                content=content,
+                reasoning="Edited visible reasoning.",
+                tool_calls=(edited_call,) if with_tools else (),
+                replay_message=original,
+            )
+        ]
+    )
+    assert isinstance(rendered[0], dict)
+    rendered_snapshot = deepcopy(rendered)
+
+    await llm.acall(rendered)
+
+    request = client.post.await_args.kwargs["json"]
+    expected = [{"type": "message", "role": "assistant", "content": "Edited visible reasoning."}]
+    if content:
+        expected.append({"type": "message", "role": "assistant", "content": content})
+    if with_tools:
+        expected.append(
+            {"type": "function_call", "call_id": "call-1", "name": "weather", "arguments": '{"city":"Berlin"}'}
+        )
+    assert request.model_dump(mode="json", exclude_none=True)["input"] == expected
+    assert state.calls[-1].request == request
+    assert original.model_dump(mode="json") == original_snapshot
+    assert state.calls[0].response.model_dump(mode="json") == original_response
+    assert rendered == rendered_snapshot
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_tools", [False, True])
+async def test_unscoped_history_replays_public_fields_instead_of_live_raw_response(with_tools: bool) -> None:
+    raw = NeMoGymResponse.model_validate(mixed_model_response())
+    raw_snapshot = raw.model_dump(mode="json")
+    replacement = LLMResponse(
+        raw_response=raw,
+        content="Replacement answer.",
+        reasoning="Replacement reasoning.",
+        tool_calls=[ToolCall(id="edited-call", name="weather", arguments='{"city":"Berlin"}')] if with_tools else [],
+    )
+    assert replacement.replay_scope is None
+    llm, client, state = make_llm(model_response())
+
+    await llm.acall([replacement])
+
+    expected = [
+        {"type": "message", "role": "assistant", "content": "Replacement reasoning."},
+        {"type": "message", "role": "assistant", "content": "Replacement answer."},
+    ]
+    if with_tools:
+        expected.append(
+            {"type": "function_call", "call_id": "edited-call", "name": "weather", "arguments": '{"city":"Berlin"}'}
+        )
+    request = client.post.await_args.kwargs["json"]
+    assert request.model_dump(mode="json", exclude_none=True)["input"] == expected
+    assert state.calls[-1].request == request
+    assert raw.model_dump(mode="json") == raw_snapshot
+    assert [gap.code for gap in state.gaps] == ["foreign_turn_projected_portable"]
 
 
 @pytest.mark.asyncio
