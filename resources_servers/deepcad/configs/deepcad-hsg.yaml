@@ -5,8 +5,9 @@ deepcad:
       entrypoint: app.py
       domain: coding
       verified: false
-      description: Reconstruct DeepCAD solids with Python and CadQuery from sampled diagonal or dimensioned front, side, and top views
-      value: Solid-volume IoU after similarity Procrustes alignment; invalid code earns zero
+      description: Reconstruct DeepCAD solids with Python and CadQuery from fixed sampled diagonal or front, side, and top views with optional dimensions
+      value: Filled voxel IoU at pitch 1/64 after independent bbox normalization; invalid code earns zero
+      voxel_resolution: 64
       reference_root: resources_servers/deepcad/data
       sandbox_provider: sandbox
       sandbox_image: /home/rohitkumarj/data/deepcad/gym/cadquery-2.8.0.sqsh

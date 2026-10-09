@@ -55,7 +55,7 @@ def test_worker_protocol(tmp_path: Path, capsys, missing: str | None) -> None:
         reference = tmp_path / "missing.step"
     elif missing == "prediction":
         prediction = tmp_path / "missing.step"
-    with patch("sys.argv", ["geometry", str(prediction), str(reference), "256", "10"]):
+    with patch("sys.argv", ["geometry", str(prediction), str(reference), "64"]):
         geometry.main()
     result = json.loads(capsys.readouterr().out)
     if missing:
@@ -75,20 +75,64 @@ def test_load_invalid_solid() -> None:
             geometry.load_solid(Path("invalid.step"))
 
 
-def test_zero_area_surface() -> None:
+def test_empty_mesh() -> None:
     shape = MagicMock()
     shape.BoundingBox.return_value.DiagonalLength = 1
-    shape.tessellate.return_value = ([cq.Vector(i, 0, 0) for i in range(3)], [(0, 1, 2)])
-    with pytest.raises(ValueError, match="sample"):
-        geometry.surface_points(shape, 32)
+    shape.tessellate.return_value = ([], [])
+    with pytest.raises(ValueError, match="Empty"):
+        geometry.normalized_mesh(shape)
 
 
-def test_nonfinite_iou() -> None:
+def test_degenerate_mesh() -> None:
+    shape = MagicMock()
+    shape.BoundingBox.return_value.DiagonalLength = 0
+    shape.tessellate.return_value = ([cq.Vector(0, 0, 0)] * 3, [(0, 1, 2)])
+    with pytest.raises(ValueError, match="Degenerate"):
+        geometry.normalized_mesh(shape)
+
+
+def test_independent_mesh_normalization_preserves_aspect_ratio() -> None:
     shape = cq.Workplane("XY").box(1, 2, 3).val()
-    invalid = MagicMock()
-    invalid.Volume.return_value = 6.0
-    invalid.intersect.return_value.Volume.return_value = float("nan")
-    with patch.object(geometry, "alignment", return_value=(np.eye(4), 0)):
-        with patch.object(cq.Shape, "cast", return_value=invalid):
-            with pytest.raises(ValueError, match="Non-finite"):
-                geometry.score(shape, shape, samples=32)
+    for source in (shape, shape.scale(1000).translate((20, -30, 50))):
+        mesh = geometry.normalized_mesh(source)
+        np.testing.assert_allclose(mesh.bounds.mean(axis=0), [0.5, 0.5, 0.5])
+        np.testing.assert_allclose(mesh.extents, [1 / 3, 2 / 3, 1])
+    assert geometry.score(cq.Workplane("XY").box(2, 2, 3).val(), shape)["reward"] < 0.7
+
+
+def test_voxelization_fills_solids_and_preserves_through_holes() -> None:
+    box = cq.Workplane("XY").box(1, 1, 1).val()
+    filled = geometry.normalized_voxels(box)
+    assert filled.shape == (68, 68, 68) and filled.dtype == bool
+    assert filled[34, 34, 34] and np.count_nonzero(filled) > 64**3
+    drilled = cq.Workplane("XY").box(1, 1, 1).faces(">Z").workplane().hole(0.5).val()
+    hollow = geometry.normalized_voxels(drilled)
+    assert not hollow[34, 34, 34]
+    result = geometry.score(drilled, box)
+    assert 0.7 < result["reward"] < 0.9
+    assert result["reward"] == result["intersection_voxels"] / result["union_voxels"]
+    assert result["prediction_voxels"] < result["reference_voxels"]
+
+
+@pytest.mark.parametrize("resolution", [0, -1])
+def test_invalid_voxel_resolution(resolution: int) -> None:
+    with pytest.raises(ValueError, match="positive"):
+        geometry.normalized_voxels(cq.Workplane("XY").box(1, 1, 1).val(), resolution=resolution)
+
+
+def test_empty_voxel_union() -> None:
+    with pytest.raises(ValueError, match="Empty voxel union"):
+        geometry.voxel_iou(np.zeros((4, 4, 4), dtype=bool), np.zeros((4, 4, 4), dtype=bool))
+
+
+def test_reference_voxel_failure_is_masked(tmp_path: Path, capsys) -> None:
+    path = tmp_path / "part.step"
+    cq.exporters.export(cq.Workplane("XY").box(1, 2, 3), str(path))
+    with (
+        patch("sys.argv", ["geometry", str(path), str(path), "64"]),
+        patch.object(geometry, "normalized_voxels", side_effect=ValueError("bad reference mesh")),
+    ):
+        geometry.main()
+    result = json.loads(capsys.readouterr().out)
+    assert result["reward"] == 0 and result["mask_sample"]
+    assert result["failure_kind"] == "deepcad:reference"

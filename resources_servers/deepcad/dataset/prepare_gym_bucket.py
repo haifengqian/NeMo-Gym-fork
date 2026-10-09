@@ -11,6 +11,7 @@ from pathlib import Path
 
 import cadquery as cq
 
+from resources_servers.deepcad.dataset.augment_inputs import sample_annotations
 from resources_servers.deepcad.dataset.prepare_gym import (
     construction_metrics,
     dimension_data,
@@ -21,10 +22,10 @@ from resources_servers.deepcad.dataset.prepare_gym import (
 
 
 def prepare_score(
-    arguments: tuple[int, list[dict], Path, Path, int, int, float],
+    arguments: tuple[int, list[dict], Path, Path, int, int, float, float],
 ) -> tuple[list[dict], list[dict]]:
     """Try a deterministic permutation until this score has enough valid targets."""
-    score, candidates, data_root, reference_root, count, seed, probability = arguments
+    score, candidates, data_root, reference_root, count, seed, probability, no_annotations_probability = arguments
     candidates.sort(key=lambda row: hashlib.sha256(f"{seed}:{row['task_id']}".encode()).digest())
     rows, failures = [], []
     for candidate in candidates:
@@ -47,10 +48,19 @@ def prepare_score(
                 diagonal_view_probability=probability,
                 seed=seed,
                 document=document,
+                no_annotations_probability=no_annotations_probability,
             )
             rows.append(
                 task_row(
-                    identifier, name, images, metrics=metrics, dimensions_mm=dimension_data(shape)["size_mm"].tolist()
+                    identifier,
+                    name,
+                    images,
+                    metrics=metrics,
+                    dimensions_mm=dimension_data(shape)["size_mm"].tolist(),
+                    seed=seed,
+                    engineering_annotations=sample_annotations(
+                        identifier, no_annotations_probability=no_annotations_probability, seed=seed
+                    ),
                 )
             )
         except Exception as exc:  # noqa: BLE001 - retain per-target reconstruction failures
@@ -76,11 +86,14 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--diagonal-view-probability", type=float, default=0.75)
+    parser.add_argument("--no-annotations-probability", type=float, default=0.75)
     args = parser.parse_args()
     if args.min_score > args.max_score or args.per_score <= 0 or args.workers <= 0:
         parser.error("Require min-score <= max-score, positive per-score and workers")
     if not 0 <= args.diagonal_view_probability <= 1:
         parser.error("--diagonal-view-probability must be between 0 and 1")
+    if not 0 <= args.no_annotations_probability <= 1:
+        parser.error("--no-annotations-probability must be between 0 and 1")
     train_ids = set(json.loads((args.data_root / "train_val_test_split.json").read_text())["train"])
     grouped = {score: [] for score in range(args.min_score, args.max_score + 1)}
     for line in args.ranking.read_text().splitlines():
@@ -100,6 +113,7 @@ def main() -> None:
             args.per_score,
             args.seed,
             args.diagonal_view_probability,
+            args.no_annotations_probability,
         )
         for score, candidates in grouped.items()
     ]
@@ -120,6 +134,10 @@ def main() -> None:
         "score_range": [args.min_score, args.max_score],
         "per_score": dict(counts),
         "seed": args.seed,
+        "input_augmentation_seed": args.seed,
+        "no_annotations_probability": args.no_annotations_probability,
+        "annotation_counts": dict(Counter(str(row["verifier_metadata"]["engineering_annotations"]) for row in rows)),
+        "color_counts": dict(Counter(row["verifier_metadata"]["foreground_color"] for row in rows)),
         "written": len(rows),
         "failures": failures,
         "ordering": "ascending difficulty, then task_id",

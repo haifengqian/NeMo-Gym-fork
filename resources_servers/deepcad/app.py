@@ -10,6 +10,7 @@ import re
 import shlex
 import sys
 import tempfile
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -21,9 +22,11 @@ from nemo_gym.base_resources_server import (
     BaseVerifyResponse,
     SimpleResourcesServer,
 )
+from nemo_gym.openai_utils import TOKEN_METADATA_FIELDS
 from nemo_gym.sandbox import AsyncSandbox
 from nemo_gym.sandbox.config import resolve_provider_config
 from nemo_gym.sandbox.providers.base import SandboxResources, SandboxSpec
+from resources_servers.deepcad.live_rollouts import save_rollout
 from resources_servers.deepcad.task_data import TaskData
 
 
@@ -41,8 +44,9 @@ class DeepCADResourcesServerConfig(BaseResourcesServerConfig):
     geometry_timeout_s: int = Field(default=120, ge=1)
     max_code_bytes: int = Field(default=65536, ge=1)
     max_step_bytes: int = Field(default=32 * 1024 * 1024, ge=1)
-    alignment_samples: int = Field(default=2048, ge=32)
-    alignment_iterations: int = Field(default=40, ge=1)
+    voxel_resolution: int = Field(default=64, ge=8, le=256)
+    live_rollout_root: str | None = None
+    live_rollout_experiment: str = Field(default="deepcad", pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 
 
 class DeepCADVerifyRequest(BaseVerifyRequest):
@@ -50,8 +54,13 @@ class DeepCADVerifyRequest(BaseVerifyRequest):
 
 
 class DeepCADVerifyResponse(BaseVerifyResponse):
-    alignment_error: float | None = None
-    transform: list[list[float]] | None = None
+    scoring_method: str | None = None
+    voxel_resolution: int | None = None
+    intersection_voxels: int | None = None
+    union_voxels: int | None = None
+    prediction_voxels: int | None = None
+    reference_voxels: int | None = None
+    rollout_url: str | None = None
 
 
 def extract_code(text: str) -> str:
@@ -76,10 +85,15 @@ class DeepCADResourcesServer(SimpleResourcesServer):
     def model_post_init(self, context: Any) -> None:
         super().model_post_init(context)
         self._semaphore = asyncio.Semaphore(self.config.max_concurrency)
+        if self.config.live_rollout_root:
+            (Path(self.config.live_rollout_root).expanduser() / self.config.live_rollout_experiment).mkdir(
+                parents=True, exist_ok=True
+            )
 
     async def verify(self, body: DeepCADVerifyRequest) -> DeepCADVerifyResponse:
         """Execute code in isolation, then score the exported solid in a trusted worker."""
         result: dict[str, Any]
+        rollout_id = uuid.uuid4().hex if self.config.live_rollout_root else None
         code = extract_code(assistant_text(body))
         if not code or len(code.encode()) > self.config.max_code_bytes:
             result = {"reward": 0.0, "failure_kind": "deepcad:code", "failure_reason": "Empty or oversized code"}
@@ -90,10 +104,34 @@ class DeepCADResourcesServer(SimpleResourcesServer):
                 result = {"reward": 0.0, "failure_kind": "deepcad:syntax", "failure_reason": str(exc)}
             else:
                 async with self._semaphore:
-                    result = await self._evaluate(code, body.verifier_metadata.reference_step)
+                    if rollout_id:
+                        result = await self._evaluate(
+                            code, body.verifier_metadata.reference_step, rollout_id=rollout_id
+                        )
+                    else:
+                        result = await self._evaluate(code, body.verifier_metadata.reference_step)
+        if rollout_id:
+            try:
+                url = await asyncio.to_thread(
+                    save_rollout,
+                    Path(self.config.live_rollout_root).expanduser(),
+                    self.config.live_rollout_experiment,
+                    rollout_id,
+                    metadata=body.verifier_metadata.model_dump(mode="json"),
+                    inputs=body.responses_create_params.model_dump(mode="json")["input"],
+                    outputs=[
+                        item.model_dump(mode="json", exclude=TOKEN_METADATA_FIELDS) for item in body.response.output
+                    ],
+                    code=code,
+                    result=result,
+                )
+                if url:
+                    result["rollout_url"] = url
+            except (OSError, ValueError, KeyError):
+                LOGGER.exception("Could not save DeepCAD live rollout")
         return DeepCADVerifyResponse(**body.model_dump(), **result)
 
-    async def _evaluate(self, code: str, reference_step: str) -> dict[str, Any]:
+    async def _evaluate(self, code: str, reference_step: str, *, rollout_id: str | None = None) -> dict[str, Any]:
         root = Path(self.config.reference_root).expanduser().resolve()
         reference = (root / reference_step).resolve()
         if not reference.is_relative_to(root) or not reference.is_file():
@@ -155,6 +193,19 @@ class DeepCADResourcesServer(SimpleResourcesServer):
                             "failure_reason": "Missing or oversized STEP artifact",
                         }
                     await sandbox.download("/sandbox/prediction.step", prediction)
+                if rollout_id and self.config.live_rollout_root:
+                    try:
+                        artifact = (
+                            Path(self.config.live_rollout_root).expanduser()
+                            / self.config.live_rollout_experiment
+                            / "rollouts"
+                            / rollout_id
+                            / "prediction.step"
+                        )
+                        artifact.parent.mkdir(parents=True, exist_ok=True)
+                        artifact.write_bytes(prediction.read_bytes())
+                    except OSError:
+                        LOGGER.exception("Could not save generated STEP for live rollout")
                 return await self._score(prediction, reference)
         except Exception as exc:
             LOGGER.exception("DeepCAD infrastructure failure")
@@ -171,8 +222,7 @@ class DeepCADResourcesServer(SimpleResourcesServer):
             str(HERE / "geometry.py"),
             str(prediction),
             str(reference),
-            str(self.config.alignment_samples),
-            str(self.config.alignment_iterations),
+            str(self.config.voxel_resolution),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )

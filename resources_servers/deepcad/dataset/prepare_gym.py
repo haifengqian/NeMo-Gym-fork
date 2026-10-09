@@ -25,6 +25,8 @@ from OCP.GeomAbs import GeomAbs_Circle
 from OCP.gp import gp_Vec
 from PIL import Image, ImageDraw, ImageFont
 
+from resources_servers.deepcad.dataset.augment_inputs import augment_inputs, sample_annotations
+
 
 def construction_metrics(document: dict) -> dict[str, int]:
     """Count feature records and only profiles referenced by their extrusions.
@@ -273,8 +275,10 @@ def dimension_data(shape: cq.Shape, document: dict | None = None) -> dict:
     }
 
 
-def render_views(shape: cq.Shape, directory: Path, *, document: dict | None = None) -> dict[str, Path]:
-    """Render dimensioned front (-Y), side (+X), top (+Z), at one orthographic scale."""
+def render_views(
+    shape: cq.Shape, directory: Path, *, document: dict | None = None, engineering_annotations: bool = True
+) -> dict[str, Path]:
+    """Render front (-Y), side (+X), top (+Z), optionally with dimensions."""
     directory.mkdir(parents=True, exist_ok=True)
     size = shape.BoundingBox().DiagonalLength
     vertices, faces = shape.tessellate(size * 0.002, 0.05)
@@ -305,6 +309,11 @@ def render_views(shape: cq.Shape, directory: Path, *, document: dict | None = No
             draw.polygon(list(zip(x, y)), fill=(shade, shade, shade))
         # Downsampling smooths curved silhouettes without a GUI or GPU dependency.
         image = image.resize((640, 640), Image.Resampling.LANCZOS)
+        if not engineering_annotations:
+            path = directory / f"{name}.png"
+            image.resize((256, 256), Image.Resampling.LANCZOS).save(path)
+            result[name] = path
+            continue
         draw = ImageDraw.Draw(image)
 
         def project(point: np.ndarray, horizontal=horizontal, vertical=vertical, name=name) -> np.ndarray:
@@ -458,14 +467,15 @@ def render_diagonal_views(shape: cq.Shape, directory: Path) -> dict[str, Path]:
     vertices, faces = shape.tessellate(shape.BoundingBox().DiagonalLength * 0.002, 0.05)
     points = np.array([vertex.toTuple() for vertex in vertices])
     lower, upper = points.min(axis=0), points.max(axis=0)
-    points = (points - (lower + upper) / 2) / np.max(upper - lower)
+    center = np.array([0.5, 0.5, 0.5])
+    points = (points - (lower + upper) / 2) / np.max(upper - lower) + center
     cameras = []
     for direction in [(-1, -1, -1), (1, 1, 1), (1, -1, 1), (-1, 1, -1)]:
         camera = np.array(direction, dtype=float) / np.sqrt(3)
         right = np.cross([0, 0, 1], camera)
         right /= np.linalg.norm(right)
         up = np.cross(camera, right)
-        projected = np.stack([points @ right, points @ up], axis=1)
+        projected = np.stack([(points - center) @ right, (points - center) @ up], axis=1)
         cameras.append((camera, up, projected))
     half_height = max(0.55, max(np.abs(projected).max() for _, _, projected in cameras) * 1.05)
     vtk_points = vtk.vtkPoints()
@@ -524,8 +534,8 @@ def render_diagonal_views(shape: cq.Shape, directory: Path) -> dict[str, Path]:
     try:
         for index, (direction, up, _) in enumerate(cameras):
             camera = renderer.GetActiveCamera()
-            camera.SetPosition(*(direction * 2))
-            camera.SetFocalPoint(0, 0, 0)
+            camera.SetPosition(*(center + direction * 2))
+            camera.SetFocalPoint(*center)
             camera.SetViewUp(*up)
             camera.ParallelProjectionOn()
             camera.SetParallelScale(half_height)
@@ -555,11 +565,18 @@ def prepare_views(
     diagonal_view_probability: float = 0.75,
     seed: int = 42,
     document: dict | None = None,
+    no_annotations_probability: float = 0.75,
 ) -> dict[str, Path]:
     """Render only the view combination chosen for this prepared example."""
+    annotations = sample_annotations(task_id, no_annotations_probability=no_annotations_probability, seed=seed)
     if sample_view_mode(task_id, diagonal_view_probability=diagonal_view_probability, seed=seed) == "diagonal":
         return render_diagonal_views(shape, directory)
-    return render_views(shape, directory, document=document)
+    return render_views(
+        shape,
+        directory,
+        document=document,
+        engineering_annotations=annotations,
+    )
 
 
 def task_row(
@@ -569,29 +586,19 @@ def task_row(
     *,
     metrics: dict[str, int],
     dimensions_mm: list[float] | None = None,
+    seed: int = 42,
+    engineering_annotations: bool = True,
 ) -> dict:
     """Keep the reference path in verifier metadata, never in the model prompt."""
-    content = [
-        {
-            "type": "input_text",
-            "text": "Reconstruct this CAD solid from its front, side, and top orthographic views. Front looks along +Y; side looks along -X; top looks along -Z. Use Z as up. All views have the same scale. Dimension annotations, when present, are in millimetres; R denotes radius and depth denotes rectangular additive extrusion depth. Use millimetres in your CadQuery program.",
-        }
-    ]
     diagonal = set(images) == {"diagonal"}
-    if diagonal:
-        content[0]["text"] = (
-            "Reconstruct this CAD solid from four diagonal orthographic views in a 2x2 composite. "
-            "Camera directions relative to the part center (X,Y,Z): top-left (-1,-1,-1); "
-            "top-right (+1,+1,+1); bottom-left (+1,-1,+1); bottom-right (-1,+1,-1). "
-            "All cameras look toward the center with world Z as up. Views share one scale; "
-            "the longest bounding-box side is normalized to 1. Use millimetres in your CadQuery program."
+    description = "Reproduce the geometry shown in the following views."
+    if engineering_annotations and dimensions_mm is not None:
+        description += (
+            " Overall bounding-box dimensions in mm (X,Y,Z): "
+            + ", ".join(f"{value:.6g}" for value in dimensions_mm)
+            + "."
         )
-        if dimensions_mm is not None:
-            content[0]["text"] += (
-                " Overall bounding-box dimensions in mm (X,Y,Z): "
-                + ", ".join(f"{value:.6g}" for value in dimensions_mm)
-                + "."
-            )
+    content = [{"type": "input_text", "text": description}]
     for view in ("diagonal",) if diagonal else ("front", "side", "top"):
         path = images[view]
         mime = mimetypes.guess_type(path.name)[0]
@@ -602,7 +609,7 @@ def task_row(
             # Supplied manifests follow the same 256px per-view input contract.
             with Image.open(path) as image:
                 output = io.BytesIO()
-                image.convert("RGB").resize((256, 256), Image.Resampling.LANCZOS).save(output, format="PNG")
+                image.convert("RGBA").resize((256, 256), Image.Resampling.LANCZOS).save(output, format="PNG")
                 payload = output.getvalue()
                 mime = "image/png"
         content.append({"type": "input_text", "text": f"{view.capitalize()} view:"})
@@ -613,12 +620,11 @@ def task_row(
                 "image_url": f"data:{mime};base64," + base64.b64encode(payload).decode(),
             }
         )
-    prompt = (Path(__file__).parent / "gym-prompt.txt").read_text().strip()
-    return {
+    row = {
         "task_source": "deepcad_simple_agent",
         "responses_create_params": {
             "input": [
-                {"role": "system", "content": prompt},
+                {"role": "system", "content": ""},
                 {"role": "user", "content": content},
             ]
         },
@@ -627,9 +633,11 @@ def task_row(
             "reference_step": reference_step,
             "difficulty": metrics["difficulty"],
             "view_mode": "diagonal" if diagonal else "axis",
+            "engineering_annotations": engineering_annotations,
             "construction_metrics": {key: value for key, value in metrics.items() if key != "difficulty"},
         },
     }
+    return augment_inputs(row, seed=seed)
 
 
 def main() -> None:
@@ -660,12 +668,17 @@ def main() -> None:
         default=0.75,
         help="Probability of four diagonal views (0: front/side/top; 1: diagonal only)",
     )
-    parser.add_argument("--seed", type=int, default=42, help="Seed for the reproducible per-task view choice")
+    parser.add_argument(
+        "--seed", type=int, default=42, help="Seed for fixed per-task view, annotation, and color choices"
+    )
+    parser.add_argument("--no-annotations-probability", type=float, default=0.75)
     args = parser.parse_args()
     if args.limit <= 0:
         parser.error("--limit must be positive")
     if not 0 <= args.diagonal_view_probability <= 1:
         parser.error("--diagonal-view-probability must be between 0 and 1")
+    if not 0 <= args.no_annotations_probability <= 1:
+        parser.error("--no-annotations-probability must be between 0 and 1")
     args.reference_root.mkdir(parents=True, exist_ok=True)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     rows, failures = [], []
@@ -683,6 +696,9 @@ def main() -> None:
             records.append(record)
         records.sort(key=lambda record: (record["metrics"]["difficulty"], record["task_id"]))
         for record in records[: args.limit]:
+            annotations = sample_annotations(
+                record["task_id"], no_annotations_probability=args.no_annotations_probability, seed=args.seed
+            )
             reference = Path(record["reference_step"])
             reference = reference if reference.is_absolute() else args.manifest.parent / reference
             shape = cq.importers.importStep(str(reference)).val()
@@ -698,6 +714,10 @@ def main() -> None:
                 == "diagonal"
             ):
                 images = render_diagonal_views(shape, args.reference_root / "views" / record["task_id"])
+            elif not annotations:
+                images = render_views(
+                    shape, args.reference_root / "views" / record["task_id"], engineering_annotations=False
+                )
             rows.append(
                 task_row(
                     record["task_id"],
@@ -705,6 +725,8 @@ def main() -> None:
                     images,
                     metrics=record["metrics"],
                     dimensions_mm=dimension_data(shape)["size_mm"].tolist(),
+                    seed=args.seed,
+                    engineering_annotations=annotations,
                 )
             )
     else:
@@ -739,6 +761,7 @@ def main() -> None:
                     diagonal_view_probability=args.diagonal_view_probability,
                     seed=args.seed,
                     document=document,
+                    no_annotations_probability=args.no_annotations_probability,
                 )
                 metrics = {key: value for key, value in record.items() if key != "task_id"}
                 rows.append(
@@ -748,6 +771,10 @@ def main() -> None:
                         images,
                         metrics=metrics,
                         dimensions_mm=dimension_data(shape)["size_mm"].tolist(),
+                        seed=args.seed,
+                        engineering_annotations=sample_annotations(
+                            identifier, no_annotations_probability=args.no_annotations_probability, seed=args.seed
+                        ),
                     )
                 )
             except Exception as exc:  # noqa: BLE001 - record per-asset OCP reconstruction failures
@@ -761,6 +788,16 @@ def main() -> None:
         "difficulty_formula": "4*extrusions + sketch_curves + 2*additional_loops + 4*cuts_and_intersections",
         "diagonal_view_probability": args.diagonal_view_probability,
         "view_seed": args.seed,
+        "input_augmentation_seed": args.seed,
+        "no_annotations_probability": args.no_annotations_probability,
+        "annotation_counts": {
+            str(value): sum(row["verifier_metadata"]["engineering_annotations"] == value for row in rows)
+            for value in (False, True)
+        },
+        "color_counts": {
+            color: sum(row["verifier_metadata"]["foreground_color"] == color for row in rows)
+            for color in sorted({row["verifier_metadata"]["foreground_color"] for row in rows})
+        },
         "view_counts": {
             mode: sum(row["verifier_metadata"]["view_mode"] == mode for row in rows) for mode in ("axis", "diagonal")
         },

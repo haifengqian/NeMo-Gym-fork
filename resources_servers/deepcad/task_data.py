@@ -14,6 +14,13 @@ class TaskData(BaseModel):
     view_mode: Literal["axis", "diagonal"] = Field(
         default="axis", json_schema_extra={"legacy_location": "verifier_metadata"}
     )
+    foreground_color: Literal["blue", "green", "teal", "steel_blue", "violet", "amber"] | None = Field(
+        default=None, json_schema_extra={"legacy_location": "verifier_metadata"}
+    )
+    input_augmentation_seed: int | None = Field(
+        default=None, json_schema_extra={"legacy_location": "verifier_metadata"}
+    )
+    engineering_annotations: bool = Field(default=True, json_schema_extra={"legacy_location": "verifier_metadata"})
     difficulty: int | None = Field(default=None, ge=0, json_schema_extra={"legacy_location": "verifier_metadata"})
     construction_metrics: dict[str, int] | None = Field(
         default=None, json_schema_extra={"legacy_location": "verifier_metadata"}

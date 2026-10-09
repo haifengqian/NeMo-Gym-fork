@@ -8,7 +8,6 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import cadquery as cq
-import numpy as np
 import pytest
 
 from nemo_gym.sandbox.providers.base import SandboxExecResult
@@ -20,7 +19,7 @@ from resources_servers.deepcad.app import (
     assistant_text,
     extract_code,
 )
-from resources_servers.deepcad.geometry import load_solid, procrustes, score, transform_points
+from resources_servers.deepcad.geometry import load_solid, score
 
 
 def request(text: str) -> DeepCADVerifyRequest:
@@ -60,7 +59,7 @@ def server(tmp_path: Path) -> DeepCADResourcesServer:
         name="deepcad",
         reference_root=str(tmp_path),
         sandbox_provider={"docker": {}},
-        alignment_samples=256,
+        voxel_resolution=64,
     )
     client = MagicMock(spec=ServerClient)
     client.global_config_dict = {}
@@ -175,24 +174,17 @@ async def test_sandbox_outcomes(server: DeepCADResourcesServer, probe, execution
     )
 
 
-def test_procrustes_similarity_and_no_reflection() -> None:
-    points = np.random.default_rng(31).normal(size=(128, 3))
-    rotation = np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1]])
-    target = 2.5 * points @ rotation.T + [7, -3, 1]
-    matrix = procrustes(points, target)
-    np.testing.assert_allclose(transform_points(points, matrix), target, atol=1e-10)
-    assert np.linalg.det(procrustes(points, points * [-1, 1, 1])[:3, :3]) > 0
-    with pytest.raises(ValueError, match="Degenerate"):
-        procrustes(np.ones((5, 3)), np.ones((5, 3)))
-
-
-def test_identical_rotated_scaled_and_wrong_geometry() -> None:
+def test_identical_translated_scaled_and_wrong_orientation() -> None:
     reference = cq.Workplane("XY").box(1, 2, 3).val()
-    assert score(reference, reference, samples=512)["reward"] == pytest.approx(1, abs=1e-6)
-    moved = reference.scale(2.5).rotate((0, 0, 0), (1, 2, 3), 37).translate((9, -4, 3))
-    assert score(moved, reference, samples=2048, iterations=60)["reward"] > 0.97
+    result = score(reference, reference)
+    assert result["reward"] == pytest.approx(1)
+    assert result["scoring_method"] == "voxel_iou" and result["voxel_resolution"] == 64
+    moved = reference.scale(2.5).translate((9, -4, 3))
+    assert score(moved, reference)["reward"] == pytest.approx(1)
+    rotated = reference.rotate((0, 0, 0), (0, 0, 1), 90)
+    assert 0.25 < score(rotated, reference)["reward"] < 0.45
     wrong = cq.Workplane("XY").sphere(1).val()
-    assert 0 < score(wrong, reference, samples=512)["reward"] < 0.85
+    assert 0 < score(wrong, reference)["reward"] < 0.85
 
 
 def test_load_solid_rejects_shell(tmp_path: Path) -> None:
