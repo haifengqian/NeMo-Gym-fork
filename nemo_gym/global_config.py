@@ -901,7 +901,9 @@ Duplicate config paths:
         The server is named after the environment, not the agent, so a swap leaves its own name
         alone and only its references to the swapped agent have to follow.
         """
-        for instance in global_config_dict.values():
+        # Composition also runs before launch-time environment variables exist.
+        # Inspect structure without resolving unrelated endpoint or secret values.
+        for _, instance in global_config_dict.items_ex(resolve=False):
             if not isinstance(instance, DictConfig):
                 continue
             servers = instance.get(ENVIRONMENT_SERVER_TYPE_KEY_NAME)

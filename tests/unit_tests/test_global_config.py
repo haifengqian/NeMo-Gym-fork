@@ -2550,6 +2550,38 @@ class TestConfigLoadErrors:
         assert server["participant_a"]["name"] == "participant_a"
         assert server["participant_b"]["name"] == "participant_b_swapped"
 
+    @mark.parametrize("aliases", [False, True])
+    def test_retargeting_leaves_unrelated_environment_interpolations_unresolved(
+        self, monkeypatch: MonkeyPatch, aliases: bool
+    ) -> None:
+        monkeypatch.delenv("GYM_TEST_DEFERRED_POLICY_URL", raising=False)
+        config = self._multi_agent_environment_config()
+        config["selected_agent"] = "participant_b"
+        config["agent_ref_type"] = "responses_api_agents"
+        server = config["multi_agent_environment"]["environment_servers"]["multi_agent"]
+        server["participant_b"] = {"type": "${agent_ref_type}", "name": "${selected_agent}"}
+        server["agent_server"] = {"name": "${selected_agent}"}
+        if aliases:
+            config["shared_participant"] = server["participant_b"]
+            config["shared_agent_ref"] = server["agent_server"]
+            server["participant_b"] = "${shared_participant}"
+            server["agent_server"] = "${shared_agent_ref}"
+        server["resources_server"] = {"type": "resources_servers", "name": "participant_b"}
+        deferred = "${oc.env:GYM_TEST_DEFERRED_POLICY_URL}"
+        config["deferred_policy_url"] = deferred
+
+        GlobalConfigDictParser._retarget_environment_servers(config, {"participant_b": "participant_b_swapped"})
+
+        assert OmegaConf.to_container(config, resolve=False)["deferred_policy_url"] == deferred
+        assert server["participant_a"]["name"] == "participant_a"
+        assert server["participant_b"]["name"] == "participant_b_swapped"
+        assert server["participant_b"]["type"] == "responses_api_agents"
+        assert server["agent_server"]["name"] == "participant_b_swapped"
+        assert server["resources_server"]["name"] == "participant_b"
+        if aliases:
+            assert OmegaConf.to_container(server, resolve=False)["participant_b"] == "${shared_participant}"
+            assert OmegaConf.to_container(server, resolve=False)["agent_server"] == "${shared_agent_ref}"
+
     def test_agent_rename_preserves_multi_agent_environment_and_taskset(self) -> None:
         resolved = GlobalConfigDictParser().parse(
             GlobalConfigDictParserConfig(
