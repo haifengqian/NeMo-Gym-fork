@@ -4,6 +4,7 @@
 
 import argparse
 import fcntl
+import hashlib
 import json
 import mimetypes
 import re
@@ -77,8 +78,16 @@ class RolloutHandler(BaseHTTPRequestHandler):
                 inputs = contained_path(self.root, experiment, "inputs", record["input_hash"] + ".json")
                 record["input"] = json.loads(inputs.read_text())
                 record["has_step"] = path.with_name("prediction.step").is_file()
+                record["has_preview"] = path.with_name("prediction.png").is_file()
+                status = path.with_name("preview-status.json")
+                record["preview_status"] = json.loads(status.read_text()) if status.exists() else {"state": "queued"}
+                if record["has_step"] and not record["has_preview"] and record["preview_status"]["state"] != "failed":
+                    identifier_hash = hashlib.sha256(f"{experiment}/{identifier}".encode()).hexdigest()
+                    request = self.root / ".preview-requests" / (identifier_hash + ".json")
+                    if not request.exists():
+                        write_json(request, {"experiment": experiment, "id": identifier})
                 self.reply(record)
-            elif len(parts) == 4 and parts[0] == "file" and parts[3] == "prediction.step":
+            elif len(parts) == 4 and parts[0] == "file" and parts[3] in ("prediction.step", "prediction.png"):
                 path = contained_path(self.root, parts[1], "rollouts", parts[2], parts[3])
                 self.reply(path.read_bytes(), mimetypes.guess_type(path.name)[0] or "application/octet-stream")
             elif not parts or (len(parts) == 1 and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", parts[0])):

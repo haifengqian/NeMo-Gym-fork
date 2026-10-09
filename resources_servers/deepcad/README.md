@@ -117,6 +117,23 @@ It requires only Python's standard library and can stay up between GPU allocatio
 Recording is disabled when `live_rollout_root` is unset. The Super mixed recipe
 enables it and uses the W&B run name as the experiment folder.
 
+Selecting a response with a saved STEP requests a rendered preview beside its
+input images. The preview uses the same three axis views or four diagonal
+cameras, white background, and foreground color as that prompt. No generated
+Python is executed again. Cached previews also work for earlier rollouts.
+Run a separate CPU renderer in a CadQuery preparation runtime with Pillow, VTK,
+and `libosmesa6` for headless diagonal views:
+
+```bash
+uv run --no-sync python -m resources_servers.deepcad.preview_worker \
+  --root /data/deepcad/gym/live-rollouts
+```
+
+The renderer watches the shared request queue and isolates each STEP render in
+a subprocess with a 60-second timeout. Preview failures remain separate from
+the reward and STEP download. The HTTP viewer still needs only the standard
+library; completed previews remain available after the rendering worker stops.
+
 ## Validation and licensing
 
 ```bash

@@ -89,6 +89,37 @@ def test_viewer_blocks_paths_outside_rollout_root(viewer) -> None:
         assert error.value.code == 404
 
 
+def test_viewer_requests_prediction_preview_and_serves_completed_image(viewer) -> None:
+    root, url = viewer
+    record(root, "a")
+    directory = root / "experiment/rollouts/a"
+    (directory / "prediction.step").write_bytes(b"saved STEP")
+    detail = get(url + "/api/rollout/experiment/a")
+    assert detail["has_step"] and not detail["has_preview"]
+    assert detail["preview_status"]["state"] == "queued"
+    jobs = list((root / ".preview-requests").glob("*.json"))
+    assert len(jobs) == 1 and json.loads(jobs[0].read_text()) == {"experiment": "experiment", "id": "a"}
+    get(url + "/api/rollout/experiment/a")
+    assert len(list((root / ".preview-requests").glob("*.json"))) == 1
+    (directory / "prediction.png").write_bytes(b"rendered PNG")
+    write_json(directory / "preview-status.json", {"state": "ready"})
+    assert get(url + "/api/rollout/experiment/a")["has_preview"]
+    with urllib.request.urlopen(url + "/file/experiment/a/prediction.png", timeout=5) as response:
+        assert response.headers["Content-Type"] == "image/png"
+        assert response.read() == b"rendered PNG"
+
+
+def test_viewer_keeps_preview_failure_separate_from_reward(viewer) -> None:
+    root, url = viewer
+    record(root, "a", 0.8)
+    directory = root / "experiment/rollouts/a"
+    (directory / "prediction.step").write_bytes(b"saved STEP")
+    write_json(directory / "preview-status.json", {"state": "failed", "message": "renderer unavailable"})
+    detail = get(url + "/api/rollout/experiment/a")
+    assert detail["reward"] == 0.8 and detail["has_step"] and not detail["has_preview"]
+    assert not (root / ".preview-requests").exists()
+
+
 def test_saved_port_is_reused_on_restart(tmp_path: Path) -> None:
     command = [
         sys.executable,
