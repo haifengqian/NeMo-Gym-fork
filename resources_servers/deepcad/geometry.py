@@ -1,14 +1,92 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Trusted geometry worker: independently normalized, filled voxel IoU."""
+"""Trusted geometry worker: independently normalized voxel and render rewards."""
 
+import fcntl
+import hashlib
 import json
 import sys
+import time
+import uuid
 from pathlib import Path
 
 import cadquery as cq
 import numpy as np
 import trimesh
+
+from resources_servers.deepcad.surface import Camera, cameras, compare_maps, render_maps, save_diagnostics
+
+
+COMPONENT_NAMES = ("voxel_iou", "silhouette_iou", "normal_alignment", "hole_iou")
+SCORER_VERSION = "render-maps-v2"
+
+
+def aggregate_rewards(result: dict, weights: dict[str, float]) -> dict:
+    """Expose weighted components whose sum is exactly the scalar reward.
+
+    A hole score with no nonempty union is unavailable, and contributes zero.
+    Keep its component key for GDPO's stable batch schema; a group with no hole
+    scores has a constant zero column and contributes no hole advantage.
+    """
+    if set(weights) != set(COMPONENT_NAMES) or any(not np.isfinite(w) or w < 0 for w in weights.values()):
+        raise ValueError("Require a finite nonnegative weight for each reward component")
+    result["reward_components"] = {name: weights[name] * (result.get(name) or 0.0) for name in COMPONENT_NAMES}
+    result["reward"] = sum(result["reward_components"].values())
+    return result
+
+
+def reference_maps(
+    path: Path, *, mode: str, resolution: int, render_resolution: int, cache_root: Path | None
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, tuple[Camera, ...], bool]:
+    """Cache reference voxels and render maps by STEP content and scorer settings."""
+
+    def prepare() -> tuple[np.ndarray, np.ndarray, np.ndarray, tuple[Camera, ...]]:
+        shape = load_solid(path)
+        mesh = normalized_mesh(shape)
+        views = cameras(mesh, mode=mode)
+        masks, normals = render_maps(mesh, views, resolution=render_resolution)
+        if not masks.any(axis=(1, 2)).all():
+            raise ValueError("Reference has an empty surface view")
+        return normalized_voxels(shape, resolution=resolution), masks, normals, views
+
+    if cache_root is None:
+        return (*prepare(), False)
+    settings = json.dumps([SCORER_VERSION, mode, resolution, render_resolution, 0.002, 0.05])
+    digest = hashlib.sha256(path.read_bytes() + settings.encode()).hexdigest()
+    cache_root.mkdir(parents=True, exist_ok=True)
+    path_cache = cache_root / f"{digest}.npz"
+    with (cache_root / f"{digest}.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if path_cache.exists():
+            with np.load(path_cache, allow_pickle=False) as saved:
+                voxels, masks, normals = saved["voxels"], saved["masks"], saved["normals"]
+                view_data = json.loads(str(saved["cameras"]))
+            views = tuple(Camera(**item) for item in view_data)
+            expected = (4 if mode == "diagonal" else 3, render_resolution, render_resolution)
+            if (
+                voxels.shape != (resolution + 4,) * 3
+                or masks.shape != expected
+                or normals.shape != (*expected, 3)
+                or not masks.any(axis=(1, 2)).all()
+                or not np.isfinite(normals).all()
+            ):
+                raise ValueError("Invalid reference render cache")
+            return voxels, masks, normals, views, True
+        voxels, masks, normals, views = prepare()
+        temporary = cache_root / f".{digest}.{uuid.uuid4().hex}.tmp"
+        try:
+            with temporary.open("wb") as output:
+                np.savez_compressed(
+                    output,
+                    voxels=voxels,
+                    masks=masks,
+                    normals=normals,
+                    cameras=np.array(json.dumps([vars(view) for view in views])),
+                )
+            temporary.replace(path_cache)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return voxels, masks, normals, views, False
 
 
 def load_solid(path: Path) -> cq.Shape:
@@ -87,8 +165,20 @@ def score(prediction: cq.Shape, reference: cq.Shape, *, resolution: int = 64) ->
 def main() -> None:
     """Invalid reference is infrastructure; invalid prediction earns zero."""
     resolution = int(sys.argv[3]) if len(sys.argv) > 3 else 64
+    options = json.loads(sys.argv[4]) if len(sys.argv) > 4 else {}
+    rendered = options.get("render_rewards", False)
+    started = time.monotonic()
     try:
-        reference = normalized_voxels(load_solid(Path(sys.argv[2])), resolution=resolution)
+        if rendered:
+            reference, ref_masks, ref_normals, views, cache_hit = reference_maps(
+                Path(sys.argv[2]),
+                mode=options.get("view_mode", "axis"),
+                resolution=resolution,
+                render_resolution=options.get("render_resolution", 256),
+                cache_root=Path(options["cache_root"]) if options.get("cache_root") else None,
+            )
+        else:
+            reference = normalized_voxels(load_solid(Path(sys.argv[2])), resolution=resolution)
     except Exception as exc:
         print(
             json.dumps(
@@ -102,10 +192,38 @@ def main() -> None:
         )
         return
     try:
-        prediction = normalized_voxels(load_solid(Path(sys.argv[1])), resolution=resolution)
-        result = voxel_iou(prediction, reference, resolution=resolution)
+        shape = load_solid(Path(sys.argv[1]))
+        prediction = normalized_voxels(shape, resolution=resolution)
     except Exception as exc:
-        result = {"reward": 0.0, "failure_kind": "deepcad:geometry", "failure_reason": str(exc)}
+        print(json.dumps({"reward": 0.0, "failure_kind": "deepcad:geometry", "failure_reason": str(exc)}))
+        return
+    try:
+        result = voxel_iou(prediction, reference, resolution=resolution)
+        result["voxel_iou"] = result["reward"]
+        if rendered:
+            pred_masks, pred_normals = render_maps(
+                normalized_mesh(shape), views, resolution=options.get("render_resolution", 256)
+            )
+            result.update(compare_maps(pred_masks, ref_masks, pred_normals, ref_normals, views))
+            result["scoring_method"] = "cad_multireward"
+            result["reference_cache_hit"] = cache_hit
+            result["render_resolution"] = options.get("render_resolution", 256)
+            result["scorer_version"] = SCORER_VERSION
+            if options.get("artifact_dir"):
+                try:
+                    save_diagnostics(Path(options["artifact_dir"]), pred_masks, ref_masks, pred_normals, ref_normals)
+                except OSError as exc:
+                    print(f"Could not save verification diagnostics: {exc}", file=sys.stderr)
+        if options:
+            aggregate_rewards(result, options.get("reward_weights", dict.fromkeys(COMPONENT_NAMES, 1.0)))
+        result["scoring_time_s"] = time.monotonic() - started
+    except Exception as exc:
+        result = {
+            "reward": 0.0,
+            "mask_sample": True,
+            "failure_kind": "deepcad:infrastructure",
+            "failure_reason": str(exc),
+        }
     print(json.dumps(result))
 
 

@@ -120,6 +120,20 @@ def test_viewer_keeps_preview_failure_separate_from_reward(viewer) -> None:
     assert not (root / ".preview-requests").exists()
 
 
+def test_viewer_serves_verification_artifacts_outside_model_inputs(viewer) -> None:
+    root, url = viewer
+    record(root, "verification")
+    directory = root / "experiment/rollouts/verification"
+    for name in ("reference-mask.png", "prediction-normals.png", "reference-holes.png"):
+        (directory / name).write_bytes(b"verification PNG")
+    detail = get(url + "/api/rollout/experiment/verification")
+    assert len(detail["verification_images"]) == 3
+    assert detail["input"] == [{"role": "user", "content": "fixed inputs"}]
+    for name in detail["verification_images"]:
+        with urllib.request.urlopen(url + "/file/experiment/verification/" + name) as response:
+            assert response.read() == b"verification PNG" and response.headers["Content-Type"] == "image/png"
+
+
 def test_saved_port_is_reused_on_restart(tmp_path: Path) -> None:
     command = [
         sys.executable,

@@ -134,6 +134,68 @@ a subprocess with a 60-second timeout. Preview failures remain separate from
 the reward and STEP download. The HTTP viewer still needs only the standard
 library; completed previews remain available after the rendering worker stops.
 
+## Separate surface and hole rewards
+
+Enable `render_rewards: true` to compute three additional rewards from the same fixed
+three axis views or four diagonal views as the prompt. Each scoring view is 256x256 by
+default (`render_resolution`). The existing shaded model inputs are unchanged: binary
+masks and normal maps are verification-only artifacts.
+
+Prediction and reference are independently normalized with the existing bbox convention.
+Both use the reference's camera framing. A deterministic CPU depth buffer produces visible
+silhouettes and three-channel floating-point world XYZ unit normals. It requires no GPU or
+OpenGL installation. Conservative triangle/pixel intersection preserves subpixel-thin
+projections. Normal values are compared before RGB encoding; sharp CAD edges are
+not smoothed. PNG normal visualizations encode `(normal + 1) / 2` on a white background.
+
+The additional raw scores are:
+
+* `silhouette_iou`: equal-weight mean of the three or four foreground-mask IoUs.
+* `normal_alignment`: mean silhouette IoU multiplied by the equal-weight mean of per-view
+  signed normal dot products over common foreground pixels. No common pixels gives zero
+  alignment for that view. Opposite normals give a negative dot product.
+* `hole_iou`: invert each silhouette, label 8-connected background components, and remove
+  every component that touches any image edge. Score IoU of the remaining hole masks.
+  Skip views with an empty hole union in both prediction and reference; average only valid
+  views. If every view is skipped, `hole_iou` is null and `hole_valid_views` is zero.
+
+`reward_weights` has four finite, nonnegative fields: `voxel_iou`, `silhouette_iou`,
+`normal_alignment`, and `hole_iou`. Defaults are `(1, 0, 0, 0)` with render rewards disabled,
+preserving the original scorer. Nonzero additional weights require render rewards enabled.
+The returned `reward_components` contain weighted values, and `reward` is exactly their
+sum. No implicit weight normalization is applied. Raw scores are also top-level numeric
+metrics. An unavailable hole term has a zero component, not a perfect-match reward.
+Invalid code or geometry receives four zero components; reference/infrastructure failures
+are masked. GDPO uses the four stable component names; a constant-zero hole component has
+zero per-prompt advantage. For GDPO, use Gym weights of 1 and configure estimator weights
+after component normalization, in alphabetical component order.
+
+Set `reference_cache_root` to reuse reference voxels, masks, normals, and camera settings
+across GRPO responses. Cache keys include STEP content, scorer version, camera mode,
+tessellation settings and render/voxel resolutions. Atomic writes and per-key locks support
+multiple Gym replicas. Precompute these caches without modifying the input JSONL:
+
+```bash
+uv run --no-sync python -m resources_servers.deepcad.dataset.prepare_render_cache \
+  --input /data/deepcad/gym/mixed/train.augmented.shuffled.jsonl \
+  --reference-root /data/deepcad/gym/mixed/references \
+  --cache-root /data/deepcad/gym/cache/render-rewards --workers 4
+```
+
+Live rollout records retain each view's scores, common-pixel counts, skipped hole views,
+cache hits and scoring time. The viewer displays separate reference/prediction masks,
+normal visualizations and hole masks, plus an overlap image (green: common foreground;
+red: prediction only; blue: reference only). These diagnostics are saved by verification
+and do not depend on the optional shaded-preview worker.
+
+The render-rewards implementation was validated on HSG with 115 passing DeepCAD tests,
+reference-cache preparation for all 400 mixed examples, and sandbox re-verification of
+six saved Super model responses across both view modes and difficulty bands. GRPO and
+GDPO recipes passed native NeMo-RL schema checks; the four-component GDPO batch produced
+finite advantages and zero hole advantage for inactive groups. Browser checks loaded all
+seven diagnostic images for both view modes without changing model inputs. This validation
+did not launch a new training run with the additional rewards.
+
 ## Validation and licensing
 
 ```bash

@@ -14,12 +14,12 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from pydantic import Field, PrivateAttr
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
 from nemo_gym.base_resources_server import (
+    BaseMultiRewardVerifyResponse,
     BaseResourcesServerConfig,
     BaseVerifyRequest,
-    BaseVerifyResponse,
     SimpleResourcesServer,
 )
 from nemo_gym.openai_utils import TOKEN_METADATA_FIELDS
@@ -34,6 +34,14 @@ LOGGER = logging.getLogger(__name__)
 HERE = Path(__file__).resolve().parent
 
 
+class RewardWeights(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    voxel_iou: float = Field(default=1.0, ge=0, allow_inf_nan=False)
+    silhouette_iou: float = Field(default=0.0, ge=0, allow_inf_nan=False)
+    normal_alignment: float = Field(default=0.0, ge=0, allow_inf_nan=False)
+    hole_iou: float = Field(default=0.0, ge=0, allow_inf_nan=False)
+
+
 class DeepCADResourcesServerConfig(BaseResourcesServerConfig):
     reference_root: str = "resources_servers/deepcad/data"
     sandbox_provider: str | dict[str, Any] = "sandbox"
@@ -45,21 +53,46 @@ class DeepCADResourcesServerConfig(BaseResourcesServerConfig):
     max_code_bytes: int = Field(default=65536, ge=1)
     max_step_bytes: int = Field(default=32 * 1024 * 1024, ge=1)
     voxel_resolution: int = Field(default=64, ge=8, le=256)
+    render_rewards: bool = False
+    render_resolution: int = Field(default=256, ge=32, le=512)
+    reference_cache_root: str | None = None
+    reward_weights: RewardWeights = Field(default_factory=RewardWeights)
     live_rollout_root: str | None = None
     live_rollout_experiment: str = Field(default="deepcad", pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+
+    @model_validator(mode="after")
+    def validate_render_weights(self) -> "DeepCADResourcesServerConfig":
+        if not self.render_rewards and any(
+            value > 0 for name, value in self.reward_weights.model_dump().items() if name != "voxel_iou"
+        ):
+            raise ValueError("Nonzero silhouette, normal, or hole weights require render_rewards=true")
+        return self
 
 
 class DeepCADVerifyRequest(BaseVerifyRequest):
     verifier_metadata: TaskData
 
 
-class DeepCADVerifyResponse(BaseVerifyResponse):
+class DeepCADVerifyResponse(BaseMultiRewardVerifyResponse):
     scoring_method: str | None = None
     voxel_resolution: int | None = None
     intersection_voxels: int | None = None
     union_voxels: int | None = None
     prediction_voxels: int | None = None
     reference_voxels: int | None = None
+    voxel_iou: float = 0.0
+    silhouette_iou: float | None = None
+    normal_dot: float | None = None
+    normal_alignment: float | None = None
+    hole_iou: float | None = None
+    hole_valid_views: int = 0
+    surface_common_pixels: int | None = None
+    surface_union_pixels: int | None = None
+    render_resolution: int | None = None
+    reference_cache_hit: bool | None = None
+    scorer_version: str | None = None
+    scoring_time_s: float | None = None
+    view_scores: list[dict[str, str | float | int | None]] | None = None
     rollout_url: str | None = None
 
 
@@ -106,10 +139,23 @@ class DeepCADResourcesServer(SimpleResourcesServer):
                 async with self._semaphore:
                     if rollout_id:
                         result = await self._evaluate(
-                            code, body.verifier_metadata.reference_step, rollout_id=rollout_id
+                            code,
+                            body.verifier_metadata.reference_step,
+                            view_mode=body.verifier_metadata.view_mode,
+                            rollout_id=rollout_id,
                         )
                     else:
-                        result = await self._evaluate(code, body.verifier_metadata.reference_step)
+                        result = await self._evaluate(
+                            code, body.verifier_metadata.reference_step, view_mode=body.verifier_metadata.view_mode
+                        )
+        if "reward_components" not in result:
+            result["voxel_iou"] = result["reward"]
+            result["reward_components"] = {
+                "voxel_iou": result["reward"],
+                "silhouette_iou": 0.0,
+                "normal_alignment": 0.0,
+                "hole_iou": 0.0,
+            }
         if rollout_id:
             try:
                 url = await asyncio.to_thread(
@@ -131,7 +177,9 @@ class DeepCADResourcesServer(SimpleResourcesServer):
                 LOGGER.exception("Could not save DeepCAD live rollout")
         return DeepCADVerifyResponse(**body.model_dump(), **result)
 
-    async def _evaluate(self, code: str, reference_step: str, *, rollout_id: str | None = None) -> dict[str, Any]:
+    async def _evaluate(
+        self, code: str, reference_step: str, *, view_mode: str = "axis", rollout_id: str | None = None
+    ) -> dict[str, Any]:
         root = Path(self.config.reference_root).expanduser().resolve()
         reference = (root / reference_step).resolve()
         if not reference.is_relative_to(root) or not reference.is_file():
@@ -206,7 +254,15 @@ class DeepCADResourcesServer(SimpleResourcesServer):
                         artifact.write_bytes(prediction.read_bytes())
                     except OSError:
                         LOGGER.exception("Could not save generated STEP for live rollout")
-                return await self._score(prediction, reference)
+                diagnostics = None
+                if rollout_id and self.config.live_rollout_root:
+                    diagnostics = (
+                        Path(self.config.live_rollout_root).expanduser()
+                        / self.config.live_rollout_experiment
+                        / "rollouts"
+                        / rollout_id
+                    )
+                return await self._score(prediction, reference, view_mode=view_mode, artifact_dir=diagnostics)
         except Exception as exc:
             LOGGER.exception("DeepCAD infrastructure failure")
             return {
@@ -216,13 +272,28 @@ class DeepCADResourcesServer(SimpleResourcesServer):
                 "failure_reason": str(exc),
             }
 
-    async def _score(self, prediction: Path, reference: Path) -> dict[str, Any]:
+    async def _score(
+        self, prediction: Path, reference: Path, *, view_mode: str = "axis", artifact_dir: Path | None = None
+    ) -> dict[str, Any]:
+        options = {
+            "render_rewards": self.config.render_rewards,
+            "view_mode": view_mode,
+            "render_resolution": self.config.render_resolution,
+            "cache_root": self.config.reference_cache_root,
+            "reward_weights": self.config.reward_weights.model_dump(),
+            "artifact_dir": str(artifact_dir) if artifact_dir else None,
+        }
         process = await asyncio.create_subprocess_exec(
             sys.executable,
             str(HERE / "geometry.py"),
             str(prediction),
             str(reference),
             str(self.config.voxel_resolution),
+            json.dumps(options),
+            env={
+                **os.environ,
+                "PYTHONPATH": str(HERE.parents[1]) + os.pathsep + os.environ.get("PYTHONPATH", ""),
+            },
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )

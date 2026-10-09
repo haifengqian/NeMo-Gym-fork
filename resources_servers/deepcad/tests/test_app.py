@@ -16,6 +16,7 @@ from resources_servers.deepcad.app import (
     DeepCADResourcesServer,
     DeepCADResourcesServerConfig,
     DeepCADVerifyRequest,
+    RewardWeights,
     assistant_text,
     extract_code,
 )
@@ -100,6 +101,8 @@ async def test_invalid_code_zero(server: DeepCADResourcesServer, text: str, kind
     response = await server.verify(request(text))
     assert response.reward == 0 and not response.mask_sample
     assert response.failure_kind == f"deepcad:{kind}"
+    assert set(response.reward_components) == {"voxel_iou", "silhouette_iou", "normal_alignment", "hole_iou"}
+    assert sum(response.reward_components.values()) == 0
 
 
 @pytest.mark.asyncio
@@ -201,6 +204,33 @@ async def test_real_worker(server: DeepCADResourcesServer) -> None:
     assert (await server._score(path, path.parent / "missing.step"))["mask_sample"]
     result = await server._score(path.parent / "missing.step", path)
     assert result["reward"] == 0 and not result.get("mask_sample", False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["axis", "diagonal"])
+async def test_real_multireward_worker(server: DeepCADResourcesServer, tmp_path: Path, mode: str) -> None:
+    server.config.render_rewards = True
+    server.config.reward_weights = RewardWeights(voxel_iou=2, silhouette_iou=3, normal_alignment=4, hole_iou=5)
+    server.config.reference_cache_root = str(tmp_path / "cache")
+    path = Path(server.config.reference_root) / "box.step"
+    result = await server._score(path, path, view_mode=mode, artifact_dir=tmp_path / "diagnostics")
+    assert result["voxel_iou"] == result["silhouette_iou"] == 1
+    assert result["normal_alignment"] == pytest.approx(1)
+    assert result["hole_iou"] is None and result["hole_valid_views"] == 0
+    assert result["reward"] == pytest.approx(9)
+    assert result["reward_components"] == {"voxel_iou": 2, "silhouette_iou": 3, "normal_alignment": 4, "hole_iou": 0}
+    assert not result["reference_cache_hit"]
+    assert (await server._score(path, path, view_mode=mode))["reference_cache_hit"]
+    assert len(list((tmp_path / "diagnostics").glob("*.png"))) == 7
+
+
+def test_config_rejects_disabled_render_rewards_with_nonzero_weights() -> None:
+    with pytest.raises(ValueError, match="render_rewards=true"):
+        DeepCADResourcesServerConfig(
+            host="localhost", port=8080, entrypoint="app.py", name="deepcad", reward_weights={"silhouette_iou": 1}
+        )
+    with pytest.raises(ValueError):
+        RewardWeights(normal_alignment=-1)
 
 
 @pytest.mark.asyncio

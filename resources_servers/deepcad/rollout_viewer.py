@@ -17,6 +17,17 @@ from urllib.parse import parse_qs, unquote, urlparse
 from resources_servers.deepcad.live_rollouts import write_json
 
 
+VERIFICATION_IMAGES = (
+    "reference-mask.png",
+    "prediction-mask.png",
+    "mask-overlap.png",
+    "reference-normals.png",
+    "prediction-normals.png",
+    "reference-holes.png",
+    "prediction-holes.png",
+)
+
+
 def contained_path(root: Path, *parts: str) -> Path:
     """Keep all viewer reads inside the configured rollout directory."""
     path = root.joinpath(*parts).resolve()
@@ -79,6 +90,9 @@ class RolloutHandler(BaseHTTPRequestHandler):
                 record["input"] = json.loads(inputs.read_text())
                 record["has_step"] = path.with_name("prediction.step").is_file()
                 record["has_preview"] = path.with_name("prediction.png").is_file()
+                record["verification_images"] = [
+                    name for name in VERIFICATION_IMAGES if path.with_name(name).is_file()
+                ]
                 status = path.with_name("preview-status.json")
                 record["preview_status"] = json.loads(status.read_text()) if status.exists() else {"state": "queued"}
                 if record["has_step"] and not record["has_preview"] and record["preview_status"]["state"] != "failed":
@@ -87,7 +101,11 @@ class RolloutHandler(BaseHTTPRequestHandler):
                     if not request.exists():
                         write_json(request, {"experiment": experiment, "id": identifier})
                 self.reply(record)
-            elif len(parts) == 4 and parts[0] == "file" and parts[3] in ("prediction.step", "prediction.png"):
+            elif (
+                len(parts) == 4
+                and parts[0] == "file"
+                and parts[3] in ("prediction.step", "prediction.png", *VERIFICATION_IMAGES)
+            ):
                 path = contained_path(self.root, parts[1], "rollouts", parts[2], parts[3])
                 self.reply(path.read_bytes(), mimetypes.guess_type(path.name)[0] or "application/octet-stream")
             elif not parts or (len(parts) == 1 and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", parts[0])):

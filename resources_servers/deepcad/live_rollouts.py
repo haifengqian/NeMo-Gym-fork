@@ -58,6 +58,11 @@ def save_rollout(
         "reward": result["reward"],
         "failure_kind": result.get("failure_kind"),
         "mask_sample": result.get("mask_sample", False),
+        "reward_components": result.get("reward_components"),
+        "voxel_iou": result.get("voxel_iou"),
+        "silhouette_iou": result.get("silhouette_iou"),
+        "normal_alignment": result.get("normal_alignment"),
+        "hole_iou": result.get("hole_iou"),
     }
     # Multiple Gym replicas share this append-only index on Lustre. Keep large
     # prompts and model outputs out of it so the viewer can tail new entries.
