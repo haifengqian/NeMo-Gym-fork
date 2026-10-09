@@ -86,5 +86,6 @@ def test_swe_recipe_uses_borrowed_sandbox_and_native_environment(recipe: str, be
     assert agent.max_policy_calls is None
     assert environment.resources_server.name == "swebench_pro_nooa_resources_server"
     assert not environment.resources_tool_transports
+    assert environment.finish_agent_before_verification is benchagent
     resources = config[environment.resources_server.name].resources_servers.swebench_pro
     assert resources.allowed_agents == ["nooa_agent"]

@@ -275,3 +275,102 @@ finally:
     assert summary["error"] == "launch handle lost after process creation"
     assert summary["cleanup_confirmed"] is True
     assert summary["child_alive"] is False
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux subreaper contract")
+@pytest.mark.parametrize(
+    "ending", ["normal", "crash", "timeout", "cancel", "stop-file", "timeout-grace", "cancel-grace", "stop-file-grace"]
+)
+def test_deferred_cleanup_retains_services_only_on_success(tmp_path: Path, ending: str) -> None:
+    worker = tmp_path / "worker.py"
+    worker.write_text(
+        "import pathlib, signal, subprocess, sys, time\n"
+        "def checkpoint(*_): raise SystemExit(0)\n"
+        "if sys.argv[1].endswith('-grace'): signal.signal(signal.SIGTERM, checkpoint)\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], start_new_session=True)\n"
+        "pathlib.Path('service.tmp').write_text(str(child.pid))\n"
+        "pathlib.Path('service.tmp').replace('service.pid')\n"
+        "if sys.argv[1] == 'crash': raise SystemExit(7)\n"
+        "if sys.argv[1].startswith(('timeout', 'cancel', 'stop-file')): time.sleep(60)\n"
+    )
+    completion, stop, cleanup = (tmp_path / name for name in ("completion.json", "stop", "cleanup.json"))
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-I",
+            str(SUPERVISOR),
+            "--timeout",
+            "0.8" if ending.startswith("timeout") else "10",
+            "--cleanup-timeout",
+            "0.2",
+            "--stop-file",
+            str(stop),
+            "--pid-file",
+            str(tmp_path / "supervisor.pid"),
+            "--completion-receipt",
+            str(completion),
+            "--receipt",
+            str(cleanup),
+            "--",
+            sys.executable,
+            str(worker),
+            ending,
+        ],
+        cwd=tmp_path,
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while not (tmp_path / "service.pid").exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        service = int((tmp_path / "service.pid").read_text())
+        assert int((tmp_path / "supervisor.pid").read_text()) == process.pid
+        if ending.startswith("cancel"):
+            process.send_signal(signal.SIGTERM)
+        if ending.startswith("stop-file"):
+            stop.touch()
+        while not completion.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert completion.exists()
+        worker_result = json.loads(completion.read_text())
+        assert worker_result["timed_out"] is ending.startswith("timeout")
+        if ending.endswith("-grace"):
+            assert worker_result["return_code"] == 0
+        if ending == "normal":
+            assert json.loads(completion.read_text()) == {"return_code": 0, "timed_out": False}
+            assert process.poll() is None
+            assert not cleanup.exists()
+            os.kill(service, 0)  # Verification can still reach a live detached service.
+            stop.touch()
+        process.wait(timeout=5)
+        assert json.loads(cleanup.read_text())["cleanup_confirmed"] is True
+        with pytest.raises(ProcessLookupError):
+            os.kill(service, 0)
+    finally:
+        stop.touch()
+        if process.poll() is None:
+            process.send_signal(signal.SIGTERM)
+            process.wait(timeout=5)
+
+
+def test_supervisor_requires_stop_file_for_deferred_cleanup(tmp_path: Path) -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            str(SUPERVISOR),
+            "--completion-receipt",
+            str(tmp_path / "completion.json"),
+            "--receipt",
+            str(tmp_path / "cleanup.json"),
+            "--",
+            sys.executable,
+            "-c",
+            "pass",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 2
+    assert "requires --stop-file" in result.stderr
+    assert not (tmp_path / "completion.json").exists()

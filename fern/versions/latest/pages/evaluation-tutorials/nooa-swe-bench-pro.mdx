@@ -4,7 +4,7 @@ description: "Run NOOA through the native Environment Server and a Resources-own
 ---
 
 NOOA uses Gym's native agent sessions. The `single_agent_turn` Environment Server seeds Resources, opens and invokes
-NOOA, closes the agent, asks Resources to verify, and closes Resources. Call the Environment Server's `/run`; NOOA
+NOOA, closes the agent by default, asks Resources to verify, and closes Resources. Call the Environment Server's `/run`; NOOA
 no longer implements `/run` or assigns rewards. Sessions support one activation, with identical retries sharing it.
 Use one agent-server worker; independent sessions can still execute concurrently.
 
@@ -16,7 +16,7 @@ and network on that host; embedded mode provides no sandbox protection.
 `nooa.execution_mode: sandboxed` runs the complete NOOA agent in the Resources-provided sandbox. Resources must
 return direct `SandboxAccess`; NOOA never provisions or destroys the sandbox. NOOA prepares its runtime under
 `/opt/nemo-gym-nooa`, keeps session files under `/tmp/nemo-gym-nooa`, and executes in the supplied task workdir.
-It stops its runner before disconnecting so verification can safely inspect the workspace.
+The Environment Server determines whether successful agent services remain running during verification.
 
 The sandbox needs Linux, a supported portable Python target, writable `/opt`, `tar`, one of `curl`, `wget` or an existing `python3`, and outbound
 HTTPS for runtime installation. Model and Resources URLs must be reachable from the sandbox. A host-loopback URL
@@ -26,12 +26,35 @@ is not automatically rewritten. No host virtual environment or provider credenti
 
 Direct HTTP tool grants arrive through the native session. Generated `self.*` resource methods, `GymResponsesLLM`,
 and `GymTraceHooks` execute alongside NOOA. Model and resource cookies remain separate; final resource cookies
-return on close for verification. Model/resource infrastructure failures fail the episode instead of becoming a
-reward-zero response. Policy-budget exhaustion remains a gradable partial response.
+return on finish or close for verification. Model/resource infrastructure failures fail the episode instead of becoming a
+reward-zero response. Policy-budget exhaustion remains a gradable partial response unless an unrecovered infrastructure failure also occurred.
 
 Hooks capture Python execution and nested resource calls. Sandbox results are exported on completion or handled
 errors; a hard kill can lose in-memory events. Sandbox-written results are agent-reported evidence, not trusted
 training records. Resources remains responsible for rewards.
+
+## Services during verification
+
+The optional BenchAgent profiles for Terminal-Bench and SWE-bench Pro set
+`finish_agent_before_verification: true` on `single_agent_turn`. Finish collects the final response, cookies,
+and evidence while keeping successful task services alive. After verification, the Environment Server closes
+the agent before destroying Resources state. Failed workers, timeouts, and cancellation still trigger bounded
+cleanup immediately. Other profiles retain close-before-verification unless they opt in.
+
+BenchAgent uses NOOA's invocation-scoped `preserve_background_services()` so fresh shells and delegated async
+work retain their services until verification finishes. The external supervisor owns final descendant cleanup.
+The TaskAgent and optional BenchAgent requirements both pin NOOA to `19caab169b018476ac433d040f6ae3f06aeff101`,
+which provides this scope and summary-fork isolation. Rebuild existing agent runtimes for the new dependency;
+keep earlier benchmark results associated with their original pins.
+
+A successful main-model call clears a recovered transport failure. Optional summarization failures do not
+set or clear the parent invocation's failure state. Required resource failures and unrecovered main-model
+failures remain fatal, and secondary cleanup failures do not replace the original terminal exception.
+
+The VLLM model adapter omits `prompt_cache_key` and removes equal duplicate `reasoning`/`reasoning_content`
+aliases when all backend URLs use `https://inference-api.nvidia.com/v1`. Other backends and unequal alias
+values keep their original request fields. These changes preserve ordered assistant history and native
+benchmark grading; they do not establish a benchmark score improvement.
 
 ## Native stateful example
 

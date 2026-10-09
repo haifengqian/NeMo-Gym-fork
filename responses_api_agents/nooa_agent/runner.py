@@ -176,7 +176,17 @@ class InProcessNOOARunner:
                             break
                 cause = cause.__cause__ or cause.__context__
 
-        fatal_error = dispatcher.fatal_error or state.fatal_error
+        # Required-resource failures remain fatal even if agent code hides them.
+        # A swallowed model failure is fatal, but an earlier model error must not
+        # replace the actual terminal exception (such as a loop guard).
+        fatal_error = dispatcher.fatal_error
+        if state.fatal_error is not None:
+            # A budget or output error after an unrecovered transport failure
+            # still lacks a valid rollout to grade. Keep the terminal cause.
+            termination_reason = None
+            termination_error = None
+        if fatal_error is None and failure is None:
+            fatal_error = state.fatal_error
         if fatal_error is not None and not isinstance(failure, asyncio.CancelledError):
             failure = fatal_error
             termination_reason = None

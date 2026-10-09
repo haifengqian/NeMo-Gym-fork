@@ -65,6 +65,7 @@ class SingleAgentTurnEnvironmentServerConfig(BaseEnvironmentServerConfig):
     resources_server: ResourcesServerRef
     agent_server: AgentServerRef
     resources_tool_transports: list[Literal["direct_http", "mcp"]] = Field(default_factory=list)
+    finish_agent_before_verification: bool = False
 
 
 class SingleAgentTurnEnvironmentServer(BaseEnvironmentServer[SingleAgentTurnRequest, SingleAgentTurnResponse]):
@@ -94,6 +95,7 @@ class SingleAgentTurnEnvironmentServer(BaseEnvironmentServer[SingleAgentTurnRequ
 
         resources_session_id = f"resources-session-{uuid4().hex}"
         resources_cookies: dict[str, str] = {}
+        verification_completed = False
 
         async def close_resources() -> None:
             close_response = await self.server_client.post(
@@ -110,6 +112,14 @@ class SingleAgentTurnEnvironmentServer(BaseEnvironmentServer[SingleAgentTurnRequ
         # Register cleanup before seed so a lost seed response cannot hide the caller-assigned session ID.
         # Final cleanup closes this session after run() returns, outside the episode deadline.
         resources_cleanup = cleanup.register_cleanup("resources session", close_resources)
+
+        async def retry_resources_after_verification() -> None:
+            if verification_completed:
+                await resources_cleanup.close()
+
+        # Register the resource retry below both agent attempts in LIFO order.
+        # Even a failed first agent close must retry before its sandbox is destroyed.
+        cleanup.register_cleanup("post-verification resources session", retry_resources_after_verification)
 
         try:
             seed_http_response = await self.server_client.post(
@@ -180,11 +190,11 @@ class SingleAgentTurnEnvironmentServer(BaseEnvironmentServer[SingleAgentTurnRequ
         agent_response = None
         close_error: str | None = None
 
-        async def collect_agent_close() -> None:
+        async def collect_agent_close(*, finish: bool = False) -> None:
             nonlocal agent_close_response, resources_cookies
             close_http_response = await self.server_client.post(
                 server_name=self.config.agent_server.name,
-                url_path="/v1/agent_sessions/close",
+                url_path="/v1/agent_sessions/finish" if finish else "/v1/agent_sessions/close",
                 json=AgentCloseSessionRequest(
                     agent_session_id=agent_session_id,
                     episode_id=request.episode_id,
@@ -282,10 +292,15 @@ class SingleAgentTurnEnvironmentServer(BaseEnvironmentServer[SingleAgentTurnRequ
                     terminal=not _is_retryable_dependency_error(error),
                 ) from error
 
-        # Verification needs this close response: it carries the Agent's observations and final Resources cookies.
-        # Session-capable agents replay this receipt when ServerClient retries a lost reply.
+        # Finish collects final cookies/evidence while retaining successful task services.
+        # A deadline still requires bounded close before grading the stopped state.
+        # Session-capable agents replay evidence when ServerClient retries a lost reply.
         try:
-            await agent_cleanup.close()
+            if agent_timed_out or not self.config.finish_agent_before_verification:
+                await agent_cleanup.close()
+            else:
+                async with asyncio.timeout(self.config.cleanup_timeout_seconds):
+                    await collect_agent_close(finish=True)
         except Exception as error:
             raise self._failure(
                 stage="cleanup",
@@ -342,7 +357,9 @@ class SingleAgentTurnEnvironmentServer(BaseEnvironmentServer[SingleAgentTurnRequ
             ) from error
 
         # Keep one bounded retry in final unwind without erasing a completed verdict.
-        cleanup.register_cleanup("post-verification resources session", resources_cleanup.close)
+        verification_completed = True
+        # LIFO unwind must close the agent before destroying its borrowed sandbox.
+        cleanup.register_cleanup("post-verification agent session", agent_cleanup.close)
         return SingleAgentTurnResponse(
             episode_id=request.episode_id,
             task_id=request.task.task_id,

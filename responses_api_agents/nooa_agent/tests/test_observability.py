@@ -65,6 +65,7 @@ async def test_model_transport_preserves_scoped_ownership_on_failed_and_successf
             await llm.acall([{"role": "user", "content": "task"}])
     finally:
         trace.after_agent_call(context=child, exception=failure)
+    assert state.fatal_error is failure
     try:
         await llm.acall([{"role": "user", "content": "task"}])
     finally:
@@ -76,7 +77,7 @@ async def test_model_transport_preserves_scoped_ownership_on_failed_and_successf
     assert [call.invocation_id for call in state.calls] == ["child", "parent"]
     assert state.calls[0].response is None
     assert state.calls[1].response is not None
-    assert state.fatal_error is failure
+    assert state.fatal_error is None
 
 
 def test_scoped_projection_preserves_model_ownership_and_collector_tool_output_join() -> None:

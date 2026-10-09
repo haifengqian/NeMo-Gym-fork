@@ -185,6 +185,7 @@ def test_nooa_recipe_uses_native_borrowing_one_repeat_and_configurable_provider(
     assert resources.sandbox_config["ttl_s"] == 30000
     assert environment.default_episode_timeout_seconds == 30000
     assert not environment.resources_tool_transports
+    assert environment.finish_agent_before_verification is benchagent
     resource_config = config[environment.resources_server.name].resources_servers.terminal_bench_2_1
     assert resource_config.allowed_agents == ["nooa_agent"]
     assert resource_config.datasets[0].num_repeats == 1

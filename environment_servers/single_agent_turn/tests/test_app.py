@@ -520,11 +520,13 @@ async def test_admission_timeout_is_retryable_without_starting_sessions() -> Non
     assert client.calls == []
 
 
+@pytest.mark.parametrize("finish", [False, True])
 @pytest.mark.parametrize("cancel", [False, True], ids=["episode-timeout", "caller-cancellation"])
 async def test_interrupted_activation_closes_agent_before_resources(
-    monkeypatch: pytest.MonkeyPatch, *, cancel: bool
+    monkeypatch: pytest.MonkeyPatch, *, cancel: bool, finish: bool
 ) -> None:
     environment, client = _environment_server()
+    environment.config.finish_agent_before_verification = finish
     environment.config.default_episode_timeout_seconds = 0.05
     responses = client.responses
     client.responses = [*responses[:2], responses[3], responses[5]]
