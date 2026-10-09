@@ -8,8 +8,9 @@ from pathlib import Path
 from shlex import quote
 from uuid import uuid4
 
+from nemo_gym.agent_utils import process_supervisor
 from nemo_gym.rollout_observability import AgentObservationBundle, ObservationGap
-from nemo_gym.sandbox import AsyncSandbox, process_supervisor
+from nemo_gym.sandbox import AsyncSandbox
 from responses_api_agents.nooa_agent.config import NOOAInvocationConfig
 from responses_api_agents.nooa_agent.runner import NOOARunFailure, NOOARunRequest, NOOARunResult
 from responses_api_agents.nooa_agent.sandbox_entrypoint import SandboxInput, SandboxResult
