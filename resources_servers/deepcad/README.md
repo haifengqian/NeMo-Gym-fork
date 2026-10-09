@@ -1,6 +1,6 @@
 # DeepCAD reconstruction
 
-The model receives exactly three dimensioned images, labeled **front**, **side**, and **top**, and writes Python with CadQuery. It must assign a `cadquery.Workplane` or `cadquery.Shape` containing valid solids to `result`. Generated DeepCAD views include overall sizes, circle/arc radius leaders (up to six distinct radii per view), and axis-aligned rectangular additive extrusion depths (up to two per view), where available. All labels use millimetres; the prompt asks for CadQuery lengths in millimetres.
+The model receives either three dimensioned **front**, **side**, and **top** images or a composite of four diagonal orthographic views, and writes Python with CadQuery. Preparation defaults to `p = 0.75` for diagonal views and `1 - p = 0.25` for front/side/top. The view combination is sampled once per example from its task ID and seed, so all GRPO responses for that example use the same images. It must assign a `cadquery.Workplane` or `cadquery.Shape` containing valid solids to `result`. The axis views include overall sizes, circle/arc radius leaders (up to six distinct radii per view), and axis-aligned rectangular additive extrusion depths (up to two per view), where available. All labels use millimetres; the prompt asks for CadQuery lengths in millimetres.
 
 The verifier executes code in a disposable NeMo Gym sandbox, exports the result as STEP, and computes solid-volume intersection-over-union against the hidden reference. Syntax errors, runtime errors, timeouts, missing results, and invalid or empty solids earn **0**. Dataset and sandbox infrastructure failures return `mask_sample: true` with a reason.
 
@@ -23,7 +23,7 @@ Configure a vision-capable model server and credentials using its normal Gym con
 
 HSG uses the separate CadQuery image `~/data/deepcad/gym/cadquery-2.8.0.sqsh`. Use the standalone `configs/deepcad-hsg.yaml` configuration on HSG. The parent `cad-rl` rem project uses `rl.nightly.sep30.2026.sqsh`.
 
-## Three-view data
+## View augmentation and data
 
 The conversion utility, dimension renderer, and prompt live in this environment's `dataset/prepare_gym.py` and `dataset/gym-prompt.txt`. Run preparation from the Gym checkout. Supply a JSONL manifest with local image paths relative to the manifest and a trusted reference STEP:
 
@@ -37,18 +37,32 @@ uv run --no-sync python -m resources_servers.deepcad.dataset.prepare_gym \
   --reference-root /path/references --output /path/tasks-gym.jsonl
 ```
 
-Set the resources server's `reference_root` to the same reference directory. The utility embeds all three PNG/JPEG/WebP images in Responses API messages; target paths appear only in `verifier_metadata`. No text descriptions are required. Supplied views should use the labeled orthographic directions and a common scale. For an existing DeepCAD split, the utility can reconstruct unquantized JSON sketches/extrusions using modern OCP and render the three views:
+Set the resources server's `reference_root` to the same reference directory. The utility embeds the selected views in Responses API messages; target paths appear only in `verifier_metadata`. No text descriptions are required. Supplied views should use the labeled orthographic directions and a common scale. Headless Linux preparation uses CPU off-screen VTK and requires `libosmesa6` (`apt-get install -y libosmesa6`); the provided Dockerfile includes it. For an existing DeepCAD split, the utility can reconstruct unquantized JSON sketches/extrusions using modern OCP and render the selected views:
 
 ```bash
 uv run --no-sync python -m resources_servers.deepcad.dataset.prepare_gym \
   --data-root ~/data/deepcad --split validation --limit 100 \
   --reference-root ~/data/deepcad/gym/references \
-  --output ~/data/deepcad/gym/validation.jsonl
+  --output ~/data/deepcad/gym/validation.jsonl \
+  --diagonal-view-probability 0.75 --seed 42
 ```
 
-The renderer produces 640×640 images at a shared orthographic scale. Overall sizes and circular radii come from the final B-rep, with the source JSON's metres converted to millimetres. Radii are only labeled in views normal to their circle plane; projected duplicates are counted once. Depth labels describe rectangular additive features in the construction history, rather than inferred wall thickness. Dimensions describe the target geometry; reward still permits uniform-scale alignment. Supplied-image manifests preserve their input images and should include dimension annotations if desired.
+Each individual view is 256×256 pixels at a shared orthographic scale. Front/side/top are three separate images. Diagonal views use BenchCAD's quadrant directions: top-left `(-1,-1,-1)`, top-right `(+1,+1,+1)`, bottom-left `(+1,-1,+1)`, and bottom-right `(-1,+1,-1)`, all looking toward the center with world Z up. The four 256px views form a 524×524 composite with 4px white gutters. Geometry is normalized by its longest bounding-box side; the prompt also supplies overall XYZ sizes in millimetres. The off-screen VTK renderer starts with BenchCAD's 0.55 half-height and widens the shared frame only when needed to keep all four views unclipped. Overall sizes and circular radii come from the final B-rep, with the source JSON's metres converted to millimetres. Radii are only labeled in views normal to their circle plane; projected duplicates are counted once. Depth labels describe rectangular additive features in the construction history, rather than inferred wall thickness. Dimensions describe the target geometry; reward still permits uniform-scale alignment. Supplied-image manifests use resized 256px input images for the axis branch, and render diagonal views from their STEP for the diagonal branch. They should include dimension annotations if desired.
 
 Preparation reports each failed reconstruction rather than silently replacing it with an incorrect target. The committed `data/example.jsonl` contains five validation tasks and their reference STEP files. Large training/validation files stay outside Git. Geometry preparation is offline; only prediction execution and scoring happen during verification. Regenerate JSONL after changing the renderer: images are embedded in each task, and an already-running training process keeps its loaded inputs.
+
+Set `--diagonal-view-probability 0` for front/side/top only or `1` for diagonal only. The same flag is available in `prepare_gym_bucket` and defaults to 0.75 there too. Changing `--seed` creates a different reproducible assignment; worker count, task order, and construction difficulty do not affect a task's choice. `verifier_metadata.view_mode` records `axis` or `diagonal`, and preparation reports include the probability, seed, and actual view counts.
+
+To augment an existing original front/side/top JSONL while preserving its target STEP files, difficulty values, membership, and ordering:
+
+```bash
+uv run --no-sync python -m resources_servers.deepcad.dataset.augment_views \
+  --input /path/original.jsonl --output /path/augmented.jsonl \
+  --reference-root /path/references --views-root /path/augmented-views \
+  --diagonal-view-probability 0.75 --seed 42 --workers 4
+```
+
+Use a separate output file to retain the original dataset. Read its `.report.json` for the realized mix. Train with that new JSONL; image selection happens before tokenization and multimodal preprocessing.
 
 ## Construction difficulty
 

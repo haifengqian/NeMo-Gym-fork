@@ -13,17 +13,18 @@ import cadquery as cq
 
 from resources_servers.deepcad.dataset.prepare_gym import (
     construction_metrics,
+    dimension_data,
+    prepare_views,
     reconstruct,
-    render_views,
     task_row,
 )
 
 
 def prepare_score(
-    arguments: tuple[int, list[dict], Path, Path, int, int],
+    arguments: tuple[int, list[dict], Path, Path, int, int, float],
 ) -> tuple[list[dict], list[dict]]:
     """Try a deterministic permutation until this score has enough valid targets."""
-    score, candidates, data_root, reference_root, count, seed = arguments
+    score, candidates, data_root, reference_root, count, seed, probability = arguments
     candidates.sort(key=lambda row: hashlib.sha256(f"{seed}:{row['task_id']}".encode()).digest())
     rows, failures = [], []
     for candidate in candidates:
@@ -39,8 +40,19 @@ def prepare_score(
             shape = cq.importers.importStep(str(reference_root / name)).val()
             if not shape.isValid() or not shape.Solids() or shape.Volume() <= 0:
                 raise ValueError("Exported reference failed STEP round-trip solid validation")
-            images = render_views(shape, reference_root / "views" / identifier, document=document)
-            rows.append(task_row(identifier, name, images, metrics=metrics))
+            images = prepare_views(
+                shape,
+                reference_root / "views" / identifier,
+                task_id=identifier,
+                diagonal_view_probability=probability,
+                seed=seed,
+                document=document,
+            )
+            rows.append(
+                task_row(
+                    identifier, name, images, metrics=metrics, dimensions_mm=dimension_data(shape)["size_mm"].tolist()
+                )
+            )
         except Exception as exc:  # noqa: BLE001 - retain per-target reconstruction failures
             failures.append({"task_id": identifier, "difficulty": score, "reason": str(exc)})
             continue
@@ -63,9 +75,12 @@ def main() -> None:
     parser.add_argument("--per-score", type=int, default=50)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--diagonal-view-probability", type=float, default=0.75)
     args = parser.parse_args()
     if args.min_score > args.max_score or args.per_score <= 0 or args.workers <= 0:
         parser.error("Require min-score <= max-score, positive per-score and workers")
+    if not 0 <= args.diagonal_view_probability <= 1:
+        parser.error("--diagonal-view-probability must be between 0 and 1")
     train_ids = set(json.loads((args.data_root / "train_val_test_split.json").read_text())["train"])
     grouped = {score: [] for score in range(args.min_score, args.max_score + 1)}
     for line in args.ranking.read_text().splitlines():
@@ -84,6 +99,7 @@ def main() -> None:
             args.reference_root,
             args.per_score,
             args.seed,
+            args.diagonal_view_probability,
         )
         for score, candidates in grouped.items()
     ]
@@ -108,6 +124,8 @@ def main() -> None:
         "failures": failures,
         "ordering": "ascending difficulty, then task_id",
         "ranking": str(args.ranking),
+        "diagonal_view_probability": args.diagonal_view_probability,
+        "view_counts": dict(Counter(row["verifier_metadata"]["view_mode"] for row in rows)),
     }
     args.output.with_suffix(".report.json").write_text(json.dumps(report, indent=2) + "\n")
     if counts != Counter({score: args.per_score for score in grouped}):

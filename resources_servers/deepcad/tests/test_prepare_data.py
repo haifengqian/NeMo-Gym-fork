@@ -1,7 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import base64
 import copy
+import hashlib
+import io
 import json
 from pathlib import Path
 from unittest.mock import patch
@@ -16,7 +19,10 @@ from resources_servers.deepcad.dataset.prepare_gym import (
     dimension_data,
     main,
     rank_split,
+    render_diagonal_views,
     render_views,
+    sample_view_mode,
+    task_row,
 )
 
 
@@ -111,6 +117,8 @@ def test_cli_sorts_before_limit_and_preserves_images(tmp_path: Path) -> None:
         str(tmp_path / "refs"),
         "--limit",
         "1",
+        "--diagonal-view-probability",
+        "0",
     ]
     with (
         patch("sys.argv", args),
@@ -167,14 +175,91 @@ def test_dimensions_use_final_geometry_and_convert_metres_to_mm(tmp_path: Path) 
     assert set(paths) == {"front", "side", "top"}
     for name, path in paths.items():
         image = Image.open(path)
-        assert image.size == (640, 640)
+        assert image.size == (256, 256)
         pixels = np.asarray(image)
         # View title, overall size labels and radius leaders occupy reserved margins.
-        assert np.any(pixels[10:40, 10:530] < 100)
-        assert np.any(pixels[565:605, 100:540] < 100)
-        assert np.any(pixels[110:530, 565:610] < 100)
+        assert np.any(pixels[4:16, 4:212] < 180)
+        assert np.any(pixels[226:242, 40:216] < 180)
+        assert np.any(pixels[44:212, 226:244] < 180)
         if name == "top":
-            assert np.any(pixels[40:80, 10:600] < 100)
+            assert np.any(pixels[16:32, 4:240] < 180)
+
+
+@pytest.mark.parametrize("probability,mode", [(0, "axis"), (1, "diagonal")])
+def test_view_probability_extremes(probability: float, mode: str) -> None:
+    assert all(sample_view_mode(str(index), diagonal_view_probability=probability) == mode for index in range(100))
+
+
+@pytest.mark.parametrize("probability", [-0.01, 1.01, float("nan"), float("inf")])
+def test_invalid_view_probability(probability: float) -> None:
+    with pytest.raises(ValueError, match="between 0 and 1"):
+        sample_view_mode("part", diagonal_view_probability=probability)
+
+
+def test_view_sampling_ratio_and_reproducibility() -> None:
+    ids = [f"part-{index}" for index in range(2000)]
+    selected = {identifier: sample_view_mode(identifier) for identifier in ids}
+    assert 0.72 < sum(mode == "diagonal" for mode in selected.values()) / len(ids) < 0.78
+    assert selected == {identifier: sample_view_mode(identifier) for identifier in reversed(ids)}
+    assert selected != {identifier: sample_view_mode(identifier, seed=43) for identifier in ids}
+
+
+def test_views_are_independent_of_bucket_selection() -> None:
+    # The medium preparer selects the lowest candidate hashes using seed 42.
+    ids = sorted(
+        [f"candidate-{index}" for index in range(5000)],
+        key=lambda identifier: hashlib.sha256(f"42:{identifier}".encode()).digest(),
+    )[:200]
+    ratio = sum(sample_view_mode(identifier) == "diagonal" for identifier in ids) / len(ids)
+    assert 0.67 < ratio < 0.83
+
+
+def test_diagonal_composite_and_prompt(tmp_path: Path) -> None:
+    shape = cq.Workplane("XY").box(0.02, 0.03, 0.004).faces(">Z").workplane().hole(0.006).val()
+    images = render_diagonal_views(shape, tmp_path)
+    image = Image.open(images["diagonal"])
+    assert image.size == (524, 524)
+    pixels = np.asarray(image)
+    assert np.all(pixels[:4] == 255) and np.all(pixels[:, :4] == 255)
+    assert np.all(pixels[260:264] == 255) and np.all(pixels[:, 260:264] == 255)
+    for x, y in ((4, 4), (264, 4), (4, 264), (264, 264)):
+        tile = pixels[y : y + 256, x : x + 256]
+        assert np.any(tile < 200)
+        assert np.all(tile[:2] == 255) and np.all(tile[-2:] == 255)
+        assert np.all(tile[:, :2] == 255) and np.all(tile[:, -2:] == 255)
+    row = task_row("part", "private.step", images, metrics=construction_metrics(document()), dimensions_mm=[20, 30, 4])
+    assert row["verifier_metadata"]["view_mode"] == "diagonal"
+    prompt = row["responses_create_params"]
+    assert "three input images" not in json.dumps(prompt)
+    assert "top-left (-1,-1,-1)" in json.dumps(prompt)
+    assert "20, 30, 4" in json.dumps(prompt)
+    assert "private.step" not in json.dumps(prompt)
+    assert sum(item["type"] == "input_image" for item in prompt["input"][1]["content"]) == 1
+
+
+@pytest.mark.parametrize("probability,mode,count,size", [(0, "axis", 3, (256, 256)), (1, "diagonal", 1, (524, 524))])
+def test_augment_existing_row_preserves_target(
+    tmp_path: Path, probability: float, mode: str, count: int, size: tuple[int, int]
+) -> None:
+    from resources_servers.deepcad.dataset.augment_views import augment
+    from resources_servers.deepcad.task_data import TaskData
+
+    shape = cq.Workplane("XY").box(0.02, 0.03, 0.004).val()
+    cq.exporters.export(shape, str(tmp_path / "part.step"))
+    images = render_views(shape, tmp_path / "original")
+    row = task_row("part", "part.step", images, metrics=construction_metrics(document()))
+    original = copy.deepcopy(row)
+    result = augment((row, tmp_path, tmp_path / "new", probability, 42))
+    assert result["verifier_metadata"] == original["verifier_metadata"] | {"view_mode": mode}
+    TaskData.model_validate(result["verifier_metadata"])
+    inputs = [
+        item for item in result["responses_create_params"]["input"][1]["content"] if item["type"] == "input_image"
+    ]
+    assert len(inputs) == count
+    assert all(
+        Image.open(io.BytesIO(base64.b64decode(item["image_url"].split(",", 1)[1]))).size == size for item in inputs
+    )
+    assert result["task_source"] == original["task_source"]
 
 
 def test_plate_depth_with_mislabeled_outer_loops() -> None:

@@ -1,13 +1,19 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Convert DeepCAD JSON or supplied three-view manifests to NeMo Gym tasks."""
+"""Convert DeepCAD JSON or supplied views to difficulty-ranked NeMo Gym tasks."""
 
 import argparse
 import base64
+import ctypes.util
+import hashlib
+import io
 import json
 import math
 import mimetypes
+import os
+import sys
 from pathlib import Path
+from typing import Literal
 
 import cadquery as cq
 import numpy as np
@@ -422,9 +428,138 @@ def render_views(shape: cq.Shape, directory: Path, *, document: dict | None = No
             fill="#17375e",
         )
         path = directory / f"{name}.png"
-        image.save(path)
+        image.resize((256, 256), Image.Resampling.LANCZOS).save(path)
         result[name] = path
     return result
+
+
+def sample_view_mode(
+    task_id: str, *, diagonal_view_probability: float = 0.75, seed: int = 42
+) -> Literal["axis", "diagonal"]:
+    """Sample once per task, independently of ordering, workers, or failed assets."""
+    if not 0 <= diagonal_view_probability <= 1:
+        raise ValueError("diagonal_view_probability must be between 0 and 1")
+    # Use a separate hash domain from difficulty-bucket candidate selection.
+    draw = int.from_bytes(hashlib.sha256(f"deepcad-views:{seed}:{task_id}".encode()).digest()[:8], "big") / 2**64
+    return "diagonal" if diagonal_view_probability == 1 or draw < diagonal_view_probability else "axis"
+
+
+def render_diagonal_views(shape: cq.Shape, directory: Path) -> dict[str, Path]:
+    """Use BenchCAD's diagonal cameras, VTK shading and 256px composite layout.
+
+    The shared parallel scale starts at 0.55 and expands only when a projected
+    corner would clip. VTK handles visibility with a depth buffer. Finalize the
+    off-screen window after each shape to release its graphics context.
+    """
+    import vtk
+    from vtk.util.numpy_support import numpy_to_vtk, vtk_to_numpy
+
+    directory.mkdir(parents=True, exist_ok=True)
+    vertices, faces = shape.tessellate(shape.BoundingBox().DiagonalLength * 0.002, 0.05)
+    points = np.array([vertex.toTuple() for vertex in vertices])
+    lower, upper = points.min(axis=0), points.max(axis=0)
+    points = (points - (lower + upper) / 2) / np.max(upper - lower)
+    cameras = []
+    for direction in [(-1, -1, -1), (1, 1, 1), (1, -1, 1), (-1, 1, -1)]:
+        camera = np.array(direction, dtype=float) / np.sqrt(3)
+        right = np.cross([0, 0, 1], camera)
+        right /= np.linalg.norm(right)
+        up = np.cross(camera, right)
+        projected = np.stack([points @ right, points @ up], axis=1)
+        cameras.append((camera, up, projected))
+    half_height = max(0.55, max(np.abs(projected).max() for _, _, projected in cameras) * 1.05)
+    vtk_points = vtk.vtkPoints()
+    vtk_points.SetData(numpy_to_vtk(points, deep=True))
+    cells = vtk.vtkCellArray()
+    for face in faces:
+        cells.InsertNextCell(3)
+        for vertex in face:
+            cells.InsertCellPoint(int(vertex))
+    mesh = vtk.vtkPolyData()
+    mesh.SetPoints(vtk_points)
+    mesh.SetPolys(cells)
+    normals = vtk.vtkPolyDataNormals()
+    normals.SetInputData(mesh)
+    normals.AutoOrientNormalsOn()
+    mapper = vtk.vtkPolyDataMapper()
+    mapper.SetInputConnection(normals.GetOutputPort())
+    actor = vtk.vtkActor()
+    actor.SetMapper(mapper)
+    actor.GetProperty().SetColor(110 / 255, 195 / 255, 192 / 255)
+    actor.GetProperty().SetAmbient(0.3)
+    actor.GetProperty().SetDiffuse(0.7)
+    edges = vtk.vtkFeatureEdges()
+    edges.SetInputConnection(normals.GetOutputPort())
+    edges.BoundaryEdgesOn()
+    edges.FeatureEdgesOn()
+    edges.ManifoldEdgesOff()
+    edges.NonManifoldEdgesOn()
+    edges.SetFeatureAngle(35)
+    edge_mapper = vtk.vtkPolyDataMapper()
+    edge_mapper.SetInputConnection(edges.GetOutputPort())
+    edge_mapper.ScalarVisibilityOff()
+    edge_actor = vtk.vtkActor()
+    edge_actor.SetMapper(edge_mapper)
+    edge_actor.GetProperty().SetColor(0.12, 0.12, 0.12)
+    edge_actor.GetProperty().SetLineWidth(1.6)
+    edge_actor.GetProperty().LightingOff()
+    renderer = vtk.vtkRenderer()
+    renderer.SetBackground(1, 1, 1)
+    renderer.AddActor(actor)
+    renderer.AddActor(edge_actor)
+    if sys.platform == "linux" and not os.environ.get("DISPLAY"):
+        if not ctypes.util.find_library("OSMesa"):
+            raise RuntimeError(
+                "Headless diagonal rendering requires libosmesa6; install it in the preparation runtime"
+            )
+        window = vtk.vtkOSOpenGLRenderWindow()
+    else:
+        window = vtk.vtkRenderWindow()
+    window.SetOffScreenRendering(1)
+    window.SetSize(256, 256)
+    window.AddRenderer(renderer)
+    image_filter = vtk.vtkWindowToImageFilter()
+    image_filter.SetInput(window)
+    composite = Image.new("RGB", (524, 524), "white")
+    try:
+        for index, (direction, up, _) in enumerate(cameras):
+            camera = renderer.GetActiveCamera()
+            camera.SetPosition(*(direction * 2))
+            camera.SetFocalPoint(0, 0, 0)
+            camera.SetViewUp(*up)
+            camera.ParallelProjectionOn()
+            camera.SetParallelScale(half_height)
+            renderer.ResetCameraClippingRange()
+            window.Render()
+            image_filter.Modified()
+            image_filter.Update()
+            data = image_filter.GetOutput()
+            pixels = vtk_to_numpy(data.GetPointData().GetScalars()).reshape(256, 256, -1)
+            image = Image.fromarray(np.flipud(pixels[:, :, :3]).copy())
+            composite.paste(image, (4 + (index % 2) * 260, 4 + (index // 2) * 260))
+    finally:
+        image_filter.SetInput(None)
+        renderer.RemoveAllViewProps()
+        window.RemoveRenderer(renderer)
+        window.Finalize()
+    path = directory / "diagonal.png"
+    composite.save(path)
+    return {"diagonal": path}
+
+
+def prepare_views(
+    shape: cq.Shape,
+    directory: Path,
+    *,
+    task_id: str,
+    diagonal_view_probability: float = 0.75,
+    seed: int = 42,
+    document: dict | None = None,
+) -> dict[str, Path]:
+    """Render only the view combination chosen for this prepared example."""
+    if sample_view_mode(task_id, diagonal_view_probability=diagonal_view_probability, seed=seed) == "diagonal":
+        return render_diagonal_views(shape, directory)
+    return render_views(shape, directory, document=document)
 
 
 def task_row(
@@ -433,6 +568,7 @@ def task_row(
     images: dict[str, Path],
     *,
     metrics: dict[str, int],
+    dimensions_mm: list[float] | None = None,
 ) -> dict:
     """Keep the reference path in verifier metadata, never in the model prompt."""
     content = [
@@ -441,17 +577,40 @@ def task_row(
             "text": "Reconstruct this CAD solid from its front, side, and top orthographic views. Front looks along +Y; side looks along -X; top looks along -Z. Use Z as up. All views have the same scale. Dimension annotations, when present, are in millimetres; R denotes radius and depth denotes rectangular additive extrusion depth. Use millimetres in your CadQuery program.",
         }
     ]
-    for view in ("front", "side", "top"):
+    diagonal = set(images) == {"diagonal"}
+    if diagonal:
+        content[0]["text"] = (
+            "Reconstruct this CAD solid from four diagonal orthographic views in a 2x2 composite. "
+            "Camera directions relative to the part center (X,Y,Z): top-left (-1,-1,-1); "
+            "top-right (+1,+1,+1); bottom-left (+1,-1,+1); bottom-right (-1,+1,-1). "
+            "All cameras look toward the center with world Z as up. Views share one scale; "
+            "the longest bounding-box side is normalized to 1. Use millimetres in your CadQuery program."
+        )
+        if dimensions_mm is not None:
+            content[0]["text"] += (
+                " Overall bounding-box dimensions in mm (X,Y,Z): "
+                + ", ".join(f"{value:.6g}" for value in dimensions_mm)
+                + "."
+            )
+    for view in ("diagonal",) if diagonal else ("front", "side", "top"):
         path = images[view]
         mime = mimetypes.guess_type(path.name)[0]
         if mime not in ("image/png", "image/jpeg", "image/webp"):
             raise ValueError(f"Unsupported image format: {path}")
+        payload = path.read_bytes()
+        if not diagonal:
+            # Supplied manifests follow the same 256px per-view input contract.
+            with Image.open(path) as image:
+                output = io.BytesIO()
+                image.convert("RGB").resize((256, 256), Image.Resampling.LANCZOS).save(output, format="PNG")
+                payload = output.getvalue()
+                mime = "image/png"
         content.append({"type": "input_text", "text": f"{view.capitalize()} view:"})
         content.append(
             {
                 "type": "input_image",
                 "detail": "high",
-                "image_url": f"data:{mime};base64," + base64.b64encode(path.read_bytes()).decode(),
+                "image_url": f"data:{mime};base64," + base64.b64encode(payload).decode(),
             }
         )
     prompt = (Path(__file__).parent / "gym-prompt.txt").read_text().strip()
@@ -467,6 +626,7 @@ def task_row(
             "task_id": task_id,
             "reference_step": reference_step,
             "difficulty": metrics["difficulty"],
+            "view_mode": "diagonal" if diagonal else "axis",
             "construction_metrics": {key: value for key, value in metrics.items() if key != "difficulty"},
         },
     }
@@ -494,9 +654,18 @@ def main() -> None:
     )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--reference-root", type=Path, required=True)
+    parser.add_argument(
+        "--diagonal-view-probability",
+        type=float,
+        default=0.75,
+        help="Probability of four diagonal views (0: front/side/top; 1: diagonal only)",
+    )
+    parser.add_argument("--seed", type=int, default=42, help="Seed for the reproducible per-task view choice")
     args = parser.parse_args()
     if args.limit <= 0:
         parser.error("--limit must be positive")
+    if not 0 <= args.diagonal_view_probability <= 1:
+        parser.error("--diagonal-view-probability must be between 0 and 1")
     args.reference_root.mkdir(parents=True, exist_ok=True)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     rows, failures = [], []
@@ -522,7 +691,22 @@ def main() -> None:
             name = f"{len(rows):06d}.step"
             cq.exporters.export(shape, str(args.reference_root / name))
             images = {key: args.manifest.parent / value for key, value in record["images"].items()}
-            rows.append(task_row(record["task_id"], name, images, metrics=record["metrics"]))
+            if (
+                sample_view_mode(
+                    record["task_id"], diagonal_view_probability=args.diagonal_view_probability, seed=args.seed
+                )
+                == "diagonal"
+            ):
+                images = render_diagonal_views(shape, args.reference_root / "views" / record["task_id"])
+            rows.append(
+                task_row(
+                    record["task_id"],
+                    name,
+                    images,
+                    metrics=record["metrics"],
+                    dimensions_mm=dimension_data(shape)["size_mm"].tolist(),
+                )
+            )
     else:
         split = json.loads((args.data_root / "train_val_test_split.json").read_text())[args.split]
         ranked, failures = rank_split(args.data_root, split)
@@ -548,9 +732,24 @@ def main() -> None:
                 shape = reconstruct(document)
                 name = identifier.replace("/", "_") + ".step"
                 cq.exporters.export(shape, str(args.reference_root / name))
-                images = render_views(shape, args.reference_root / "views" / identifier, document=document)
+                images = prepare_views(
+                    shape,
+                    args.reference_root / "views" / identifier,
+                    task_id=identifier,
+                    diagonal_view_probability=args.diagonal_view_probability,
+                    seed=args.seed,
+                    document=document,
+                )
                 metrics = {key: value for key, value in record.items() if key != "task_id"}
-                rows.append(task_row(identifier, name, images, metrics=metrics))
+                rows.append(
+                    task_row(
+                        identifier,
+                        name,
+                        images,
+                        metrics=metrics,
+                        dimensions_mm=dimension_data(shape)["size_mm"].tolist(),
+                    )
+                )
             except Exception as exc:  # noqa: BLE001 - record per-asset OCP reconstruction failures
                 failures.append({"task_id": identifier, "reason": str(exc)})
     args.output.write_text("".join(json.dumps(row) + "\n" for row in rows))
@@ -560,6 +759,11 @@ def main() -> None:
         "split": args.split if args.data_root else None,
         "ordering": "ascending difficulty, then task_id",
         "difficulty_formula": "4*extrusions + sketch_curves + 2*additional_loops + 4*cuts_and_intersections",
+        "diagonal_view_probability": args.diagonal_view_probability,
+        "view_seed": args.seed,
+        "view_counts": {
+            mode: sum(row["verifier_metadata"]["view_mode"] == mode for row in rows) for mode in ("axis", "diagonal")
+        },
     }
     args.output.with_suffix(".report.json").write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps({"written": len(rows), "failed": len(failures), "output": str(args.output)}))

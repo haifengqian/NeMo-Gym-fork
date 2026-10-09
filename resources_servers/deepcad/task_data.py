@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Task fields shared by dataset validation and the runtime verifier."""
 
+from typing import Literal
+
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -9,6 +11,9 @@ class TaskData(BaseModel):
     model_config = ConfigDict(extra="allow")
     task_id: str = Field(json_schema_extra={"legacy_location": "verifier_metadata"})
     reference_step: str = Field(json_schema_extra={"legacy_location": "verifier_metadata"})
+    view_mode: Literal["axis", "diagonal"] = Field(
+        default="axis", json_schema_extra={"legacy_location": "verifier_metadata"}
+    )
     difficulty: int | None = Field(default=None, ge=0, json_schema_extra={"legacy_location": "verifier_metadata"})
     construction_metrics: dict[str, int] | None = Field(
         default=None, json_schema_extra={"legacy_location": "verifier_metadata"}
