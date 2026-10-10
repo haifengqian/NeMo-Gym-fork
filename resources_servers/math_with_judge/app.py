@@ -12,9 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import contextlib
+import asyncio
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 import logging
-from io import StringIO
 from typing import Any, ClassVar, Dict, List, Optional, Union
 
 from fastapi import FastAPI
@@ -41,10 +43,48 @@ from nemo_gym.reward_profile import compute_pass_majority_metrics, highest_k_met
 from nemo_gym.server_utils import get_response_json
 
 
+_WORKER_LIBRARY_VERIFIER = None
+def _init_library_verify_worker() -> None:
+    global _WORKER_LIBRARY_VERIFIER
+    logging.getLogger("math_verify").setLevel(logging.CRITICAL)
+    _WORKER_LIBRARY_VERIFIER = math_metric(
+        gold_extraction_target=(LatexExtractionConfig(),),
+        pred_extraction_target=(
+            ExprExtractionConfig(),
+            LatexExtractionConfig(),
+        ),
+    )
+
+
+def _verify_answer_with_library_in_worker(
+    expected_answer: str, generated_answer: str
+) -> tuple[float, Optional[str]]:
+    try:
+        stripped = LibraryJudgeMathResourcesServer._strip_math_delimiters(expected_answer)
+        ground_truth_parsable = "\\boxed{" + stripped + "}"
+        ret_score, extracted_answer = _WORKER_LIBRARY_VERIFIER(
+            [ground_truth_parsable], [generated_answer]
+        )
+        reward = float(ret_score)
+        if extracted_answer is not None:
+            assert len(extracted_answer) == 2
+            extracted_gold, extracted_prediction = extracted_answer
+            for pred in extracted_prediction:
+                if any(grader.verify(gold, pred) for gold in extracted_gold):
+                    extracted_answer = pred
+                    break
+            else:
+                extracted_answer = extracted_prediction[0] if extracted_prediction else None
+        return reward, extracted_answer
+    except (Exception, TimeoutException):
+        return 0.0, None
+
+
 class LibraryJudgeMathResourcesServerConfig(BaseResourcesServerConfig):
     judge_model_server: ModelServerRef
     judge_responses_create_params: NeMoGymResponseCreateParamsNonStreaming
     should_use_judge: bool = True
+    library_verify_timeout_seconds: float = 10.0
 
 
 class LibraryJudgeMathRunRequest(BaseRunRequest):
@@ -63,54 +103,28 @@ class JudgeEvaluation(BaseModel):
 
 class LibraryJudgeMathVerifyResponse(BaseVerifyResponse):
     expected_answer: str
-    extracted_answer: Optional[str]
+    extracted_answer: Optional[str] = None
     library_reward: float
-    judge_evaluations: Optional[list[JudgeEvaluation]]
+    judge_evaluations: Optional[list[JudgeEvaluation]] = None
 
 
-def _get_field(obj: Any, key: str, default=None):
-    if isinstance(obj, dict):
-        return obj.get(key, default)
-    return getattr(obj, key, default)
+def _extract_last_boxed_answer(response: str) -> Optional[str]:
+    r"""Extract the exact contents of the last complete ``\boxed{...}``."""
+    boxed_start = response.rfind("\\boxed{")
+    if boxed_start < 0:
+        return None
 
+    content_start = boxed_start + len("\\boxed{")
+    brace_depth = 1
+    for index in range(content_start, len(response)):
+        if response[index] == "{":
+            brace_depth += 1
+        elif response[index] == "}":
+            brace_depth -= 1
+            if brace_depth == 0:
+                return response[content_start:index]
 
-def _content_to_text(content: Any) -> str:
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        pieces: list[str] = []
-        for item in content:
-            text = _get_field(item, "text", None)
-            if text is None:
-                text = _get_field(item, "content", "")
-            if isinstance(text, str):
-                pieces.append(text)
-        return "".join(pieces)
-    return str(content)
-
-
-def _extract_recoverability_prefix_text(body: BaseVerifyRequest) -> str:
-    """Return the forced assistant-prefix text for recoverability probes.
-
-    Probe rollouts carry the kept reasoning prefix as a trailing assistant input
-    item with ``generation_token_ids`` set. That prefix lives in the request
-    input rather than ``response.output``, so we prepend it to the graded text
-    to score the full assistant turn (prefix + continuation). For normal (non
-    probe) rollouts the last input item is not such an assistant message, so this
-    returns "" and is a no-op.
-    """
-    input_value = body.responses_create_params.input
-    if isinstance(input_value, str) or not input_value:
-        return ""
-
-    last_message = input_value[-1]
-    if _get_field(last_message, "role") != "assistant":
-        return ""
-    if not _get_field(last_message, "generation_token_ids"):
-        return ""
-    return _content_to_text(_get_field(last_message, "content", None))
+    return None
 
 
 class LibraryJudgeMathResourcesServer(SimpleResourcesServer):
@@ -140,20 +154,36 @@ Example output: "My final verdict is different [[A!=B]]"."""
 
     config: LibraryJudgeMathResourcesServerConfig
 
+
     def model_post_init(self, context: Any) -> None:
         super().model_post_init(context)
-
         logging.getLogger("math_verify").setLevel(logging.CRITICAL)
+        self._library_verify_executor = self._new_library_verify_executor()
 
-        # Use Latex and plain math extraction from predictions
-        # https://github.com/huggingface/Math-Verify?tab=readme-ov-file#extraction-targets
-        self._library_verifier = math_metric(
-            gold_extraction_target=(LatexExtractionConfig(),),
-            pred_extraction_target=(
-                ExprExtractionConfig(),
-                LatexExtractionConfig(),
-            ),
+
+    @staticmethod
+    def _new_library_verify_executor() -> ProcessPoolExecutor:
+        return ProcessPoolExecutor(
+            max_workers=8,
+            initializer=_init_library_verify_worker,
+            mp_context=multiprocessing.get_context("spawn"),
         )
+
+
+    def _recycle_library_verify_executor(self) -> None:
+        old_executor = self._library_verify_executor
+        self._library_verify_executor = self._new_library_verify_executor()
+        try:
+            for process in old_executor._processes.values():
+                process.kill()
+        except AttributeError:
+            print(
+                "Error: could not access ProcessPoolExecutor._processes to "
+                "kill stuck library-verify workers; the stuck worker will leak.",
+                flush=True,
+            )
+        old_executor.shutdown(wait=False, cancel_futures=True)
+
 
     def setup_webserver(self) -> FastAPI:
         app = super().setup_webserver()
@@ -174,11 +204,7 @@ Example output: "My final verdict is different [[A!=B]]"."""
                     continue
 
                 assistant_responses.append(content_item.text)
-
-        combined_response = (
-            _extract_recoverability_prefix_text(body)
-            + "".join(assistant_responses)
-        )
+        combined_response = "".join(assistant_responses)
         (
             reward,
             extracted_answer,
@@ -190,7 +216,6 @@ Example output: "My final verdict is different [[A!=B]]"."""
             reward=reward,
             extracted_answer=extracted_answer,
             library_reward=library_reward,
-            judge_evaluations=judge_evaluations,
         )
 
     async def _verify_answer(
@@ -201,24 +226,51 @@ Example output: "My final verdict is different [[A!=B]]"."""
         Verify the correctness of the specified model-generated answer to the
         specified question in comparison with the specified expected answer.
         """
+        if not generated_answer:
+            return 0.0, None, 0.0, None
+        boxed_answer = _extract_last_boxed_answer(generated_answer)
+        if boxed_answer is None or not boxed_answer.strip():
+            return 0.0, None, 0.0, None
 
-        library_reward, extracted_answer = self._verify_answer_with_library(expected_answer, generated_answer)
+        try:
+            library_reward, extracted_answer = await asyncio.wait_for(
+                asyncio.get_running_loop().run_in_executor(
+                    self._library_verify_executor,
+                    _verify_answer_with_library_in_worker,
+                    expected_answer,
+                    generated_answer,
+                ),
+                timeout=self.config.library_verify_timeout_seconds,
+            )
+        except (TimeoutError, asyncio.TimeoutError) as e:
+            print(
+                f"Error: library verify timed out after "
+                f"{self.config.library_verify_timeout_seconds}s ({e!r}); "
+                "killing every worker in the library-verify process pool "
+                "to free the stuck one (this also drops any other "
+                "in-flight calls in the pool, not just the stuck one) and "
+                "treating this call as incorrect (library_reward=0.0).",
+                flush=True,
+            )
+            self._recycle_library_verify_executor()
+            library_reward, extracted_answer = 0.0, None
+        except BrokenProcessPool as e:
+            print(
+                f"Error: library verify process pool broken ({e!r}); a "
+                "concurrent call likely just recycled it. Treating this "
+                "call as incorrect (library_reward=0.0).",
+                flush=True,
+            )
+            library_reward, extracted_answer = 0.0, None
+
         if not self.config.should_use_judge or library_reward > 0.5:
             return library_reward, extracted_answer, library_reward, None
 
-        judge_answer = extracted_answer if extracted_answer else generated_answer
-        judge_reward, judge_evaluations = await self._verify_answer_with_judge(question, expected_answer, judge_answer)
+        if len(boxed_answer) > 32000: # heuristic to avoid wasting compute
+            return 0.0, extracted_answer, library_reward, None
+        judge_reward, judge_evaluations = await self._verify_answer_with_judge(question, expected_answer, boxed_answer)
         return judge_reward, extracted_answer, library_reward, judge_evaluations
 
-    @classmethod
-    @contextlib.contextmanager
-    def _mute_output(cls):
-        devnull_out, devnull_err = StringIO(), StringIO()
-        with (
-            contextlib.redirect_stdout(devnull_out),
-            contextlib.redirect_stderr(devnull_err),
-        ):
-            yield
 
     @staticmethod
     def _strip_math_delimiters(s: str) -> str:
@@ -235,41 +287,6 @@ Example output: "My final verdict is different [[A!=B]]"."""
             s = s[1:-1].strip()
         return s
 
-    def _verify_answer_with_library(self, expected_answer: str, generated_answer: str) -> tuple[float, Optional[str]]:
-        # This functionality is migrated from Nemo RL.
-        # https://github.com/NVIDIA-NeMo/RL/blob/e1f56c42ae175d3863ccaf4e21b7de7e9c46c2e1/nemo_rl/environments/math_environment.py
-        try:
-            stripped = self._strip_math_delimiters(expected_answer)
-            ground_truth_parsable = "\\boxed{" + stripped + "}"
-            with self._mute_output():
-                ret_score, extracted_answer = self._library_verifier([ground_truth_parsable], [generated_answer])
-
-            reward = float(ret_score)
-
-            if extracted_answer is not None:
-                # Make sure the extracted answer has two elements.
-                assert len(extracted_answer) == 2
-
-                extracted_gold, extracted_prediction = extracted_answer
-
-                # Get the extracted answer.
-                for pred in extracted_prediction:
-                    if any(grader.verify(gold, pred) for gold in extracted_gold):
-                        extracted_answer = pred
-                        break
-                else:
-                    # If no match is found, that means all the answers are
-                    # incorrect.  The first prediction is used as the extracted
-                    # answer.
-                    extracted_answer = extracted_prediction[0] if extracted_prediction else None
-
-            return reward, extracted_answer
-
-        # It's possible to emit a TimeoutException and that wouldn't be caught since
-        # it actually subclasses from BaseException and math-verify itself does not
-        # catch it.
-        except (Exception, TimeoutException):
-            return 0.0, None
 
     async def _verify_answer_with_judge(
         self, question: str, expected_answer: str, generated_answer: str
